@@ -516,10 +516,10 @@ impl Worker {
         let mut targets = vec![Ipv4Addr::BROADCAST];
         if let Ok(interfaces) = if_addrs::get_if_addrs() {
             for interface in interfaces {
-                if let if_addrs::IfAddr::V4(v4) = interface.addr {
-                    if let Some(broadcast) = v4.broadcast.filter(|b| !targets.contains(b)) {
-                        targets.push(broadcast);
-                    }
+                if let if_addrs::IfAddr::V4(v4) = interface.addr
+                    && let Some(broadcast) = v4.broadcast.filter(|b| !targets.contains(b))
+                {
+                    targets.push(broadcast);
                 }
             }
         }
@@ -722,7 +722,7 @@ impl Worker {
             session.tx = None;
             session.tx_retry_at = Some(now);
         }
-        if session.tx.is_some() || !session.tx_retry_at.is_some_and(|at| now >= at) {
+        if session.tx.is_some() || session.tx_retry_at.is_none_or(|at| now < at) {
             return;
         }
         let peer = session.peer;

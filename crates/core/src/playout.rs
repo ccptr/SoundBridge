@@ -446,23 +446,21 @@ impl PlayoutReader {
                 let at = idx * ch;
                 let src = if at < a.len() { &a[at..] } else { &b[at - a.len()..] };
                 self.taps.rotate_left(1);
-                for c in 0..ch {
-                    self.taps[3][c] = src[c];
-                }
+                self.taps[3][..ch].copy_from_slice(&src[..ch]);
                 idx += 1;
                 self.phase -= 1.0;
             }
             let t = self.phase as f32;
             let mut frame = [0.0f32; 2];
-            for c in 0..ch {
+            for (c, out) in frame.iter_mut().enumerate().take(ch) {
                 let [y0, y1, y2, y3] = [self.taps[0][c], self.taps[1][c], self.taps[2][c], self.taps[3][c]];
                 // Catmull-Rom: cheap, and unlike linear interpolation does
                 // not audibly dull the top end as the phase sweeps.
                 let c1 = 0.5 * (y2 - y0);
                 let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
                 let c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
-                frame[c] = (((c3 * t + c2) * t + c1) * t + y1) * self.gain;
-                peak = peak.max(frame[c].abs());
+                *out = (((c3 * t + c2) * t + c1) * t + y1) * self.gain;
+                peak = peak.max(out.abs());
             }
             if self.gain_step != 0.0 {
                 self.gain += self.gain_step;

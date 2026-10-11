@@ -482,10 +482,10 @@ mod virtual_mic {
             let id = cpal::DeviceId::new(cpal::HostId::PipeWire, SINK);
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
-                if let Ok(host) = cpal::host_from_id(cpal::HostId::PipeWire) {
-                    if let Some(device) = host.device_by_id(&id) {
-                        return Ok((host, device));
-                    }
+                if let Ok(host) = cpal::host_from_id(cpal::HostId::PipeWire)
+                    && let Some(device) = host.device_by_id(&id)
+                {
+                    return Ok((host, device));
                 }
                 if Instant::now() > deadline {
                     return Err("the virtual microphone did not appear in PipeWire".into());

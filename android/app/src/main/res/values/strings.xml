@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SoundBridge</string>
+    <string name="channel_session">Active connection</string>
+    <string name="channel_session_description">Shown while audio is being sent or received.</string>
+    <string name="notification_connecting">Connecting…</string>
+    <string name="notification_connected">Connected to %1$s</string>
+    <string name="notification_capturing">Ready to share phone audio</string>
+    <string name="action_disconnect">Disconnect</string>
+</resources>

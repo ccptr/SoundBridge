@@ -1,0 +1,18 @@
+[package]
+name = "soundbridge-android"
+description = "The SoundBridge engine as a JNI library for the Android app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+# Built by android/app/build.gradle.kts for each ABI. On any other target the
+# crate is empty, so `cargo build --workspace` on a desktop still works.
+[target.'cfg(target_os = "android")'.dependencies]
+soundbridge-core.workspace = true
+jni = "0.21"
+ndk = { version = "0.9", features = ["audio", "api-level-28"] }
+ndk-sys = "0.6"
