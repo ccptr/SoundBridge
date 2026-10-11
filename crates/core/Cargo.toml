@@ -1,0 +1,27 @@
+[package]
+name = "soundbridge-core"
+description = "Protocol, jitter buffer and session engine shared by every SoundBridge front end"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# Desktop audio I/O through cpal. Android brings its own AAudio backend instead.
+cpal = ["dep:cpal"]
+
+[dependencies]
+rtrb = "0.4"
+socket2 = "0.6"
+if-addrs = "0.15"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+cpal = { version = "0.18.2", optional = true }
+
+# The PipeWire host is what makes system-audio capture and small quanta
+# possible on Linux; plain ALSA can do neither.
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18.2", optional = true, features = ["pipewire"] }

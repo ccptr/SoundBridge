@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/cli", "crates/desktop"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "GPL-2.0-or-later"
+
+[workspace.dependencies]
+soundbridge-core = { path = "crates/core" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+panic = "abort"
+strip = "debuginfo"
+
+# The audio path (resampler, sample conversion) is unusably slow unoptimized,
+# and a debug build that glitches tells you nothing about latency.
+[profile.dev.package.soundbridge-core]
+opt-level = 3
+[profile.dev.package.rtrb]
+opt-level = 3

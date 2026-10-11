@@ -1,0 +1,13 @@
+/target/
+
+# Android
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+/android/.idea/
+/android/.kotlin/
+*.iml
+/android/keystore.properties
+*.jks
+*.keystore
