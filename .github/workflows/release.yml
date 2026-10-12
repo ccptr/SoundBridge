@@ -1,0 +1,94 @@
+name: Release artifacts
+
+# Builds the Android APKs and the Linux binaries and attaches them to a
+# release when it is published. It can also be run by hand for an existing
+# release, to rebuild its files.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag of an existing release to build and attach files to
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  android:
+    name: Android APKs
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: gradle/actions/setup-gradle@v5
+
+      # Versions as in android/app/build.gradle.kts (compileSdk, ndkVersion).
+      - name: Install the Android platform and NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-37.0" "ndk;27.2.12479018" > /dev/null
+
+      # There is no keystore.properties here, so the release APK is unsigned.
+      - name: Build
+        working-directory: android
+        run: ./gradlew assembleDebug assembleRelease
+
+      - name: Attach to the release
+        run: |
+          out=android/app/build/outputs/apk
+          cp "$out/debug/app-debug.apk" "SoundBridge-$TAG-debug.apk"
+          cp "$out/release/app-release-unsigned.apk" "SoundBridge-$TAG-release-unsigned.apk"
+          gh release upload "$TAG" --clobber \
+            "SoundBridge-$TAG-debug.apk" "SoundBridge-$TAG-release-unsigned.apk"
+
+  linux:
+    name: Linux binaries
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang libclang-dev pkg-config \
+            libpipewire-0.3-dev libasound2-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libwayland-dev \
+            libfontconfig-dev libfreetype-dev libssl-dev libzstd-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Attach to the release
+        run: |
+          dir="soundbridge-$TAG-linux-x86_64"
+          mkdir "$dir"
+          cp target/release/soundbridge target/release/soundbridge-desktop LICENSE README.md "$dir"
+          tar -czf "$dir.tar.gz" "$dir"
+          gh release upload "$TAG" --clobber "$dir.tar.gz"
