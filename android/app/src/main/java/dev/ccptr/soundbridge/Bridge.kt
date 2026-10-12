@@ -21,6 +21,13 @@ data class Settings(
     val sendMic: Boolean = false,
     /** Send only speech from the microphone: no typing, clicks or breathing. */
     val denoise: Boolean = false,
+    /**
+     * Bring speech to a steady level. On unless switched off: a phone's
+     * microphone is far too quiet as it comes.
+     */
+    val autoGain: Boolean = true,
+    /** Gain in dB, on top of the automatic one or on its own. */
+    val gainDb: Int = 0,
     val sendPhoneAudio: Boolean = false,
     val play: Boolean = true,
     /** Fixed jitter buffer in ms, or [Native.BUFFER_AUTO]. */
@@ -121,6 +128,8 @@ object Bridge : Native.Listener {
             // there could be several.)
             sendMic = prefs.getBoolean("sendMic", prefs.getInt("send", 0) == 1),
             denoise = prefs.getBoolean("denoise", false),
+            autoGain = prefs.getBoolean("autoGain", true),
+            gainDb = prefs.getInt("gainDb", 0),
             play = prefs.getBoolean("play", true),
             bufferMs = prefs.getInt("bufferMs", Native.BUFFER_AUTO),
             host = prefs.getString("host", "") ?: "",
@@ -141,6 +150,8 @@ object Bridge : Native.Listener {
         app.getSharedPreferences("settings", Context.MODE_PRIVATE).edit {
             putBoolean("sendMic", new.sendMic)
             putBoolean("denoise", new.denoise)
+            putBoolean("autoGain", new.autoGain)
+            putInt("gainDb", new.gainDb)
             putBoolean("play", new.play)
             putInt("bufferMs", new.bufferMs)
             putString("host", new.host)
@@ -149,7 +160,9 @@ object Bridge : Native.Listener {
             BridgeService.stopProjection(app)
         }
         if (handle != 0L) {
-            Native.configure(handle, deviceName, new.sendFlags, new.denoise, new.play, new.bufferMs)
+            Native.configure(
+                handle, deviceName, new.sendFlags, new.denoise, new.autoGain, new.gainDb, new.play, new.bufferMs,
+            )
         }
         reconcile()
     }
@@ -213,7 +226,7 @@ object Bridge : Native.Listener {
             acquire()
         }
         val s = _state.value.settings
-        handle = Native.start(deviceName, s.sendFlags, s.denoise, s.play, s.bufferMs, this)
+        handle = Native.start(deviceName, s.sendFlags, s.denoise, s.autoGain, s.gainDb, s.play, s.bufferMs, this)
         _state.update { it.copy(online = handle != 0L, peers = emptyList()) }
         if (handle == 0L) notice("Could not open a network socket", error = true)
     }

@@ -26,6 +26,8 @@ use settings::{Kind, Play, Route, Settings, Source};
 use text_input::{Submitted, TextInput};
 
 /// Jitter-buffer choices offered in the UI; `None` is automatic.
+const GAIN_CHOICES: [(i32, &str); 6] =
+    [(-12, "-12 dB"), (-6, "-6 dB"), (0, "0 dB"), (6, "+6 dB"), (12, "+12 dB"), (24, "+24 dB")];
 const BUFFER_CHOICES: [(Option<u32>, &str); 5] =
     [(None, "Auto"), (Some(5), "5 ms"), (Some(10), "10 ms"), (Some(20), "20 ms"), (Some(40), "40 ms")];
 
@@ -245,6 +247,8 @@ fn config(settings: &Settings) -> Config {
                 device: source.device.clone(),
                 channels: None,
                 denoise: source.denoise && source.kind == Kind::Mic,
+                auto_gain: source.auto_gain && source.kind == Kind::Mic,
+                gain_db: if source.kind == Kind::Mic { source.gain_db as f32 } else { 0.0 },
             })
             .collect(),
         play: sinks(settings),
@@ -527,13 +531,37 @@ impl Bridge {
                         this.settings_changed(cx);
                     });
                     let block = block.child(segmented(("denoise", index), &options, source.denoise, pick));
-                    match source.denoise {
+                    let block = match source.denoise {
                         true => block.child(detail(
                             "Typing, mouse clicks, breathing and background noise are removed. \
                              Adds about 50 ms of delay.",
                         )),
                         false => block,
-                    }
+                    };
+                    let options = [(false, "Level as it is"), (true, "Automatic level")];
+                    let pick = cx.listener(move |this, &auto_gain: &bool, _, cx| {
+                        if let Some(source) = this.settings.sources.get_mut(index) {
+                            source.auto_gain = auto_gain;
+                        }
+                        this.open_picker = None;
+                        this.settings_changed(cx);
+                    });
+                    let block = block.child(segmented(("auto-gain", index), &options, source.auto_gain, pick));
+                    let pick = cx.listener(move |this, &gain_db: &i32, _, cx| {
+                        if let Some(source) = this.settings.sources.get_mut(index) {
+                            source.gain_db = gain_db;
+                        }
+                        this.open_picker = None;
+                        this.settings_changed(cx);
+                    });
+                    block.child(segmented(("gain", index), &GAIN_CHOICES, source.gain_db, pick)).child(detail(
+                        match (source.auto_gain, source.gain_db) {
+                            (true, 0) => "Speech is brought to a steady level, however quiet the microphone is.",
+                            (true, _) => "Speech is brought to a steady level, then louder or quieter by this much.",
+                            (false, 0) => "Sent as loud as the microphone delivers it.",
+                            (false, _) => "Louder or quieter by this much. A limiter keeps it from clipping.",
+                        },
+                    ))
                 }
                 Kind::System => block.child(detail("Sends whatever is playing on that output.")),
             };
@@ -541,7 +569,7 @@ impl Bridge {
         }
         let add = |id: &'static str, label: &'static str, kind, cx: &mut Context<Self>| {
             button(id, label, false).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.settings.sources.push(Source { kind, device: None, denoise: false });
+                this.settings.sources.push(Source { kind, ..Source::default() });
                 this.open_picker = None;
                 this.settings_changed(cx);
             }))

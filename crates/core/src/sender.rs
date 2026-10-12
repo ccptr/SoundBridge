@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
 use crate::audio::{SourceKind, StreamFormat};
 use crate::denoise::{self, VoiceFilter};
+use crate::gain::Leveler;
 use crate::protocol::{AUDIO_HEADER_LEN, AudioHeader, CODEC_PCM16, MAX_DATAGRAM, write_audio_header};
 
 #[derive(Default)]
@@ -23,7 +24,7 @@ impl TxShared {
     pub fn errors(&self) -> u32 {
         self.errors.load(Relaxed)
     }
-    /// Peak input level since the last call, 0..=1.
+    /// Peak level sent since the last call, 0..=1.
     pub fn take_peak(&self) -> f32 {
         f32::from_bits(self.peak.swap(0, Relaxed))
     }
@@ -40,6 +41,10 @@ pub struct StreamSpec {
     pub packet_us: u32,
     /// Send speech only. Takes effect if the device runs at [`denoise::RATE`].
     pub denoise: bool,
+    /// Bring speech to a steady level (see [`crate::gain`]).
+    pub auto_gain: bool,
+    /// Gain added on top, dB. Any gain at all also brings in the limiter.
+    pub gain_db: f32,
 }
 
 /// Lives inside the capture callback. Sending happens right there rather
@@ -57,6 +62,8 @@ pub struct Packetizer {
     filled: usize,
     shared: Arc<TxShared>,
     filter: Option<Box<VoiceFilter>>,
+    /// After the filter, so that it levels the voice and not what is removed.
+    leveler: Option<Leveler>,
 }
 
 impl Packetizer {
@@ -102,6 +109,7 @@ impl Packetizer {
             filled: 0,
             shared: shared.clone(),
             filter,
+            leveler: Leveler::new(device.sample_rate, spec.auto_gain, spec.gain_db),
         };
         (packetizer, shared, wire)
     }
@@ -141,6 +149,10 @@ impl Packetizer {
 
     /// Queues one frame for the wire and returns its peak.
     fn put(&mut self, frame: [f32; 2]) -> f32 {
+        let frame = match &mut self.leveler {
+            Some(leveler) => leveler.apply(frame),
+            None => frame,
+        };
         let mut peak = 0.0f32;
         let at = AUDIO_HEADER_LEN + self.filled * self.wire_ch * 2;
         for (c, v) in frame[..self.wire_ch].iter().enumerate() {
@@ -173,7 +185,16 @@ mod tests {
     use std::time::Duration;
 
     fn spec(channels: u16, packet_us: u32) -> StreamSpec {
-        StreamSpec { slot: 3, kind: SourceKind::Mic, stream_id: 42, channels, packet_us, denoise: false }
+        StreamSpec {
+            slot: 3,
+            kind: SourceKind::Mic,
+            stream_id: 42,
+            channels,
+            packet_us,
+            denoise: false,
+            auto_gain: false,
+            gain_db: 0.0,
+        }
     }
 
     #[test]
@@ -204,6 +225,28 @@ mod tests {
             // Downmixed to mono: (0.5 - 0.25) / 2.
             let s = i16::from_le_bytes([payload[0], payload[1]]);
             assert_eq!(s, (0.125f32 * 32767.0) as i16);
+        }
+    }
+
+    #[test]
+    fn gain_is_applied_before_the_wire_and_limited() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let tx = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let device = StreamFormat { sample_rate: 48_000, channels: 1 };
+        let spec = StreamSpec { gain_db: 20.0, ..spec(1, 2_500) };
+        let (mut p, shared, _) = Packetizer::new(tx, rx.local_addr().unwrap(), spec, device);
+
+        // A quiet packet, then one that the gain would push past full scale.
+        p.push(&[0.01; 120]);
+        p.push(&[0.5; 120]);
+        assert_eq!(shared.take_peak(), crate::gain::CEILING);
+        let mut buf = [0u8; 2048];
+        for expect in [0.1, crate::gain::CEILING] {
+            let n = rx.recv(&mut buf).unwrap();
+            let Some(Packet::Audio { payload, .. }) = decode(&buf[..n]) else { panic!() };
+            let s = i16::from_le_bytes([payload[0], payload[1]]);
+            assert!((s as f32 / 32767.0 - expect).abs() < 1e-3, "sent {s}");
         }
     }
 

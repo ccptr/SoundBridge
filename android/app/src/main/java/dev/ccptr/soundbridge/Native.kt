@@ -29,11 +29,13 @@ object Native {
 
     /**
      * Returns a handle, or 0 if no network socket could be opened. [denoise]
-     * sends only speech from the microphone.
+     * sends only speech from the microphone; [autoGain] brings it to a steady
+     * level, and [gainDb] is added to that, or is the whole gain without it.
      */
     @JvmStatic
     external fun start(
-        name: String, send: Int, denoise: Boolean, play: Boolean, bufferMs: Int, listener: Listener,
+        name: String, send: Int, denoise: Boolean, autoGain: Boolean, gainDb: Int, play: Boolean, bufferMs: Int,
+        listener: Listener,
     ): Long
 
     /** Hangs up, stops the engine and waits for its thread to finish. */
@@ -41,7 +43,10 @@ object Native {
     external fun stop(handle: Long)
 
     @JvmStatic
-    external fun configure(handle: Long, name: String, send: Int, denoise: Boolean, play: Boolean, bufferMs: Int)
+    external fun configure(
+        handle: Long, name: String, send: Int, denoise: Boolean, autoGain: Boolean, gainDb: Int, play: Boolean,
+        bufferMs: Int,
+    )
 
     /** [host] should be an IP literal: a name would be resolved on the calling thread. */
     @JvmStatic

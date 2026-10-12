@@ -59,11 +59,17 @@ pub struct SourceConfig {
     /// Send speech only: keys, clicks, breathing and background noise are
     /// removed (see [`crate::denoise`]). Makes the stream mono.
     pub denoise: bool,
+    /// Bring speech to a steady level, however loud the microphone is (see
+    /// [`crate::gain`]).
+    pub auto_gain: bool,
+    /// Gain in dB: on top of the automatic one, or on its own. Anything but
+    /// 0 also puts a limiter on the stream.
+    pub gain_db: f32,
 }
 
 impl SourceConfig {
     pub fn new(kind: SourceKind) -> Self {
-        SourceConfig { kind, device: None, channels: None, denoise: false }
+        SourceConfig { kind, device: None, channels: None, denoise: false, auto_gain: false, gain_db: 0.0 }
     }
 }
 
@@ -750,6 +756,8 @@ impl Worker {
             channels,
             packet_us: (self.config.packet_ms.clamp(0.5, 20.0) * 1000.0) as u32,
             denoise: source.denoise,
+            auto_gain: source.auto_gain,
+            gain_db: source.gain_db,
         };
         let socket = self.socket.clone();
         // The packetizer can only be built once the backend knows the device

@@ -56,6 +56,18 @@ percent of a desktop core, and needs the microphone to run at 48 kHz (it is
 sent unfiltered otherwise). Anything with a voice or a pitch of its own still
 gets through: other people talking, music, a steady hum.
 
+### Microphone level
+
+A microphone can be levelled before it is sent ("Automatic level" in the
+apps, `--auto-gain` on the command line): speech is brought to the same
+loudness however quiet or loud the microphone delivers it, and the gain holds
+still through pauses instead of turning up the room. The Android app has it on
+by default, because a phone's microphone arrives some 30 dB below a headset's.
+A gain in dB can be set as well (`--gain`), which makes the result louder or
+quieter, or is the whole gain when the automatic one is off. With either, a
+limiter keeps the stream from clipping. It runs on the sending end, before
+the audio is reduced to 16 bits, and adds no delay.
+
 ## Building
 
 ```sh

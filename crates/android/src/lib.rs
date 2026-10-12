@@ -38,10 +38,23 @@ fn log_error(message: &str) {
     }
 }
 
-fn config(name: String, send: jint, denoise: bool, play: bool, buffer_ms: jint) -> Config {
+/// What the app chose for the microphone.
+#[derive(Clone, Copy)]
+struct Mic {
+    denoise: bool,
+    auto_gain: bool,
+    gain_db: jint,
+}
+
+fn config(name: String, send: jint, mic: Mic, play: bool, buffer_ms: jint) -> Config {
     let mut sources = Vec::new();
     if send & SEND_MIC != 0 {
-        sources.push(SourceConfig { denoise, ..SourceConfig::new(SourceKind::Mic) });
+        sources.push(SourceConfig {
+            denoise: mic.denoise,
+            auto_gain: mic.auto_gain,
+            gain_db: mic.gain_db as f32,
+            ..SourceConfig::new(SourceKind::Mic)
+        });
     }
     if send & SEND_SYSTEM != 0 {
         sources.push(SourceConfig::new(SourceKind::System));
@@ -191,6 +204,8 @@ pub extern "system" fn Java_dev_ccptr_soundbridge_Native_start<'l>(
     name: JString<'l>,
     send: jint,
     denoise: jboolean,
+    auto_gain: jboolean,
+    gain_db: jint,
     play: jboolean,
     buffer_ms: jint,
     listener: JObject<'l>,
@@ -215,7 +230,8 @@ pub extern "system" fn Java_dev_ccptr_soundbridge_Native_start<'l>(
             let _ = env.exception_clear();
         }
     };
-    let config = config(name, send, denoise != 0, play != 0, buffer_ms);
+    let mic = Mic { denoise: denoise != 0, auto_gain: auto_gain != 0, gain_db };
+    let config = config(name, send, mic, play != 0, buffer_ms);
     match Engine::start(config, Arc::new(aaudio::AAudioBackend), on_event) {
         Ok(engine) => Box::into_raw(Box::new(engine)) as jlong,
         Err(e) => {
@@ -251,12 +267,15 @@ pub extern "system" fn Java_dev_ccptr_soundbridge_Native_configure<'l>(
     name: JString<'l>,
     send: jint,
     denoise: jboolean,
+    auto_gain: jboolean,
+    gain_db: jint,
     play: jboolean,
     buffer_ms: jint,
 ) {
     let name = string(&mut env, &name);
     if let Some(engine) = engine(handle) {
-        engine.configure(config(name, send, denoise != 0, play != 0, buffer_ms));
+        let mic = Mic { denoise: denoise != 0, auto_gain: auto_gain != 0, gain_db };
+        engine.configure(config(name, send, mic, play != 0, buffer_ms));
     }
 }
 

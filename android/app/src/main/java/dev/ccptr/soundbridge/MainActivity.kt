@@ -195,6 +195,24 @@ private fun Screen() {
                             "Removes everything but speech: for a phone on the desk next to a keyboard."
                         },
                     )
+                    Toggle("Automatic level", state.settings.autoGain) { on ->
+                        Bridge.update { it.copy(autoGain = on) }
+                    }
+                    Choices(
+                        options = listOf(-12 to "-12", -6 to "-6", 0 to "0 dB", 6 to "+6", 12 to "+12", 24 to "+24"),
+                        selected = state.settings.gainDb,
+                        onSelect = { db -> Bridge.update { it.copy(gainDb = db) } },
+                    )
+                    Hint(
+                        when {
+                            state.settings.autoGain && state.settings.gainDb == 0 ->
+                                "Speech is brought to a steady level, however quiet the microphone is."
+                            state.settings.autoGain ->
+                                "Speech is brought to a steady level, then louder or quieter by this much."
+                            state.settings.gainDb == 0 -> "Sent as loud as the microphone delivers it."
+                            else -> "Louder or quieter by this much. A limiter keeps it from clipping."
+                        },
+                    )
                 }
                 Toggle("Phone audio", state.settings.sendPhoneAudio, setPhoneAudio)
                 if (state.settings.sendPhoneAudio) {

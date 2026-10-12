@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use soundbridge_core::cpal_backend::CpalBackend;
+use soundbridge_core::gain::OFFSET_RANGE_DB;
 use soundbridge_core::{
     AudioBackend, BufferMode, Config, DEFAULT_PORT, DeviceDirection, Engine, Event, SinkConfig,
     SinkKind, SourceConfig, SourceKind, State, Stats, StreamFormat,
@@ -42,7 +43,10 @@ Examples:
     soundbridge connect otherpc.local --send mic
 
   Send a headset mic, voice only, and what this PC is playing:
-    soundbridge connect 192.168.1.20 --send mic=ID --send system --denoise";
+    soundbridge connect 192.168.1.20 --send mic=ID --send system --denoise
+
+  Send a quiet microphone at a normal level, a little below the usual:
+    soundbridge connect 192.168.1.20 --send mic --auto-gain --gain -3";
 
 #[derive(Subcommand)]
 enum Command {
@@ -145,6 +149,15 @@ struct LinkArgs {
     /// and background noise are removed. Adds about 50 ms of delay
     #[arg(long)]
     denoise: bool,
+    /// Bring speech from microphones to a steady level, however quiet or
+    /// loud the microphone is. A limiter keeps it from clipping
+    #[arg(long)]
+    auto_gain: bool,
+    /// Gain for microphones, dB: added to the automatic one, or a fixed
+    /// gain (with the limiter) without it
+    #[arg(long, default_value_t = 0.0, value_name = "DB", allow_negative_numbers = true,
+          value_parser = parse_gain)]
+    gain: f32,
 
     /// What to do with audio received from the peer: `speaker` (an output
     /// device), `virtual-mic` (a microphone other applications can record
@@ -188,6 +201,17 @@ enum Buffer {
     Fixed(f32),
 }
 
+fn parse_gain(s: &str) -> Result<f32, String> {
+    match s.trim_end_matches("dB").trim_end().parse::<f32>() {
+        Ok(db) if OFFSET_RANGE_DB.contains(&db) => Ok(db),
+        _ => Err(format!(
+            "expected a gain in dB between {} and {}, e.g. `6` or `-6`",
+            OFFSET_RANGE_DB.start(),
+            OFFSET_RANGE_DB.end()
+        )),
+    }
+}
+
 fn parse_buffer(s: &str) -> Result<Buffer, String> {
     if s.eq_ignore_ascii_case("auto") {
         return Ok(Buffer::Auto);
@@ -212,6 +236,8 @@ impl LinkArgs {
                     device: source.device.clone(),
                     channels: self.channels,
                     denoise: self.denoise && source.kind == SourceKind::Mic,
+                    auto_gain: self.auto_gain && source.kind == SourceKind::Mic,
+                    gain_db: if source.kind == SourceKind::Mic { self.gain } else { 0.0 },
                 })
                 .collect(),
             play: (self.play.iter())
@@ -518,6 +544,18 @@ mod tests {
         assert!(parse_sink("none").unwrap().kind.is_none());
         assert!(parse_sink("mic:loud").is_err());
         assert!(parse_sink("loud:speaker").is_err());
+    }
+
+    #[test]
+    fn gain_is_for_microphones() {
+        let cli = Cli::try_parse_from([
+            "soundbridge", "connect", "host", "--send", "mic", "--send", "system", "--auto-gain", "--gain", "-6",
+        ])
+        .unwrap();
+        let Command::Connect { link, .. } = cli.command else { panic!() };
+        let sent: Vec<_> = link.config(0, false).send.iter().map(|s| (s.auto_gain, s.gain_db)).collect();
+        assert_eq!(sent, [(true, -6.0), (false, 0.0)]);
+        assert!(Cli::try_parse_from(["soundbridge", "listen", "--gain", "90"]).is_err());
     }
 
     #[test]

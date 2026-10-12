@@ -3,20 +3,25 @@
 
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Kind {
+    #[default]
     Mic,
     System,
 }
 
 /// One stream this PC sends.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Source {
     pub kind: Kind,
     /// Device id; `None` follows the system default.
     pub device: Option<String>,
     /// Send speech only. Offered for microphones.
     pub denoise: bool,
+    /// Bring speech to a steady level. Offered for microphones.
+    pub auto_gain: bool,
+    /// Gain in dB, on top of the automatic one or on its own.
+    pub gain_db: i32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -88,7 +93,8 @@ impl Settings {
                 _ => Play::Speaker,
             };
             match key {
-                // kind|denoise|device; the device comes last as it may hold anything.
+                // kind|denoise[,auto gain,gain]|device; the device comes last as it
+                // may hold anything. Files from before there was gain lack the rest.
                 "source" => {
                     let mut fields = value.splitn(3, '|');
                     let kind = match fields.next() {
@@ -96,8 +102,12 @@ impl Settings {
                         Some("system") => Kind::System,
                         _ => continue,
                     };
-                    let denoise = fields.next() == Some("1");
-                    s.sources.push(Source { kind, device: fields.next().and_then(device), denoise });
+                    let mut flags = fields.next().unwrap_or_default().split(',');
+                    let denoise = flags.next() == Some("1");
+                    let auto_gain = flags.next() == Some("1");
+                    let gain_db = flags.next().and_then(|db| db.parse().ok()).unwrap_or(0);
+                    let device = fields.next().and_then(device);
+                    s.sources.push(Source { kind, device, denoise, auto_gain, gain_db });
                 }
                 "play_mic" => s.play_mic.play = play(value),
                 "play_mic_device" => s.play_mic.device = device(value),
@@ -124,7 +134,13 @@ impl Settings {
                 Kind::Mic => "mic",
                 Kind::System => "system",
             };
-            out += &format!("source={kind}|{}|{}\n", source.denoise as u8, device(&source.device));
+            out += &format!(
+                "source={kind}|{},{},{}|{}\n",
+                source.denoise as u8,
+                source.auto_gain as u8,
+                source.gain_db,
+                device(&source.device)
+            );
         }
         out + &format!(
             "play_mic={}\nplay_mic_device={}\nplay_system={}\nplay_system_device={}\nbuffer_ms={}\nhost={}\n",
@@ -146,9 +162,18 @@ mod tests {
     fn round_trips() {
         let settings = Settings {
             sources: vec![
-                Source { kind: Kind::Mic, device: None, denoise: true },
-                Source { kind: Kind::System, device: Some("pipewire:alsa_output.pci-0000_0e_00.4|x".into()), denoise: false },
-                Source { kind: Kind::Mic, device: Some("wasapi:{0.0.0.00000000}.{a=b}".into()), denoise: false },
+                Source { kind: Kind::Mic, denoise: true, auto_gain: true, gain_db: -6, ..Source::default() },
+                Source {
+                    kind: Kind::System,
+                    device: Some("pipewire:alsa_output.pci-0000_0e_00.4|x".into()),
+                    ..Source::default()
+                },
+                Source {
+                    kind: Kind::Mic,
+                    device: Some("wasapi:{0.0.0.00000000}.{a=b}".into()),
+                    gain_db: 12,
+                    ..Source::default()
+                },
             ],
             play_mic: Route { play: Play::VirtualMic, device: None },
             play_system: Route { play: Play::Speaker, device: Some("wasapi:{0.0.0.00000000}.{a=b}".into()) },
@@ -157,6 +182,13 @@ mod tests {
         };
         assert_eq!(Settings::parse(&settings.serialize()), settings);
         assert_eq!(Settings::parse(&Settings::default().serialize()), Settings::default());
+    }
+
+    #[test]
+    fn reads_sources_saved_before_there_was_gain() {
+        let s = Settings::parse("source=mic|1|pipewire:a|b\nsource=system|0|\n");
+        let mic = Source { kind: Kind::Mic, device: Some("pipewire:a|b".into()), denoise: true, ..Source::default() };
+        assert_eq!(s.sources, [mic, Source { kind: Kind::System, ..Source::default() }]);
     }
 
     #[test]

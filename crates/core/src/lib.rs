@@ -20,6 +20,7 @@ pub mod denoise;
 #[cfg(all(feature = "cpal", not(target_os = "android")))]
 pub mod cpal_backend;
 pub mod engine;
+pub mod gain;
 pub mod playout;
 pub mod protocol;
 pub mod sender;
