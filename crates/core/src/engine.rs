@@ -56,9 +56,10 @@ pub struct SourceConfig {
     pub device: Option<String>,
     /// Channels to send. `None` picks mono for a mic, stereo for system audio.
     pub channels: Option<u16>,
-    /// Send speech only: keys, clicks, breathing and background noise are
-    /// removed (see [`crate::denoise`]). Makes the stream mono.
-    pub denoise: bool,
+    /// How much besides speech is removed: background noise, or keys,
+    /// clicks and breathing as well (see [`crate::denoise`]). Anything but
+    /// off makes the stream mono.
+    pub denoise: denoise::Mode,
     /// Bring speech to a steady level, however loud the microphone is (see
     /// [`crate::gain`]).
     pub auto_gain: bool,
@@ -69,7 +70,14 @@ pub struct SourceConfig {
 
 impl SourceConfig {
     pub fn new(kind: SourceKind) -> Self {
-        SourceConfig { kind, device: None, channels: None, denoise: false, auto_gain: false, gain_db: 0.0 }
+        SourceConfig {
+            kind,
+            device: None,
+            channels: None,
+            denoise: denoise::Mode::Off,
+            auto_gain: false,
+            gain_db: 0.0,
+        }
     }
 }
 
@@ -157,8 +165,8 @@ pub struct TxStats {
     pub packets: u64,
     /// Peak level sent since the previous report, 0..=1.
     pub level: f32,
-    /// Noise suppression is running on this stream.
-    pub denoise: bool,
+    /// The noise suppression running on this stream.
+    pub denoise: denoise::Mode,
     /// The peer's view of this stream, if it is playing it.
     pub remote: Option<Report>,
 }
@@ -324,7 +332,7 @@ struct Tx {
     shared: Arc<TxShared>,
     format: StreamFormat,
     packet_ms: f32,
-    denoise: bool,
+    denoise: denoise::Mode,
 }
 
 /// One configured source; its index in `Session::tx` is its slot.
@@ -773,10 +781,10 @@ impl Worker {
             kind: source.kind,
             device: source.device,
             // The noise filter cannot work at any other rate.
-            sample_rate: if source.denoise { denoise::RATE } else { self.config.sample_rate },
+            sample_rate: if source.denoise.is_on() { denoise::RATE } else { self.config.sample_rate },
             channels,
             period_frames: self.config.period_frames,
-            denoise: source.denoise,
+            denoise: source.denoise.is_on(),
         };
         let opened = match source.kind {
             SourceKind::Tone => {
@@ -793,7 +801,7 @@ impl Worker {
         let stream = opened.map_err(|e| format!("Could not capture {what}: {e}"))?;
         let (shared, format, packet_ms, denoise) =
             info_rx.try_recv().map_err(|_| format!("Could not capture {what}: the stream never started"))?;
-        if source.denoise && !denoise {
+        if source.denoise.is_on() && !denoise.is_on() {
             self.emit(Event::Info(format!(
                 "Noise suppression needs a {} kHz {what}; this one runs at {}, so it is sent as it is",
                 denoise::RATE / 1000,

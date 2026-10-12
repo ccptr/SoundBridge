@@ -39,8 +39,8 @@ pub struct StreamSpec {
     /// Channels to put on the wire (1 or 2).
     pub channels: u16,
     pub packet_us: u32,
-    /// Send speech only. Takes effect if the device runs at [`denoise::RATE`].
-    pub denoise: bool,
+    /// What to filter out. Takes effect if the device runs at [`denoise::RATE`].
+    pub denoise: denoise::Mode,
     /// Bring speech to a steady level (see [`crate::gain`]).
     pub auto_gain: bool,
     /// Gain added on top, dB. Any gain at all also brings in the limiter.
@@ -75,8 +75,8 @@ impl Packetizer {
         spec: StreamSpec,
         device: StreamFormat,
     ) -> (Packetizer, Arc<TxShared>, StreamFormat) {
-        let filter = (spec.denoise && device.sample_rate == denoise::RATE)
-            .then(|| Box::new(VoiceFilter::new()));
+        let filter = (spec.denoise.is_on() && device.sample_rate == denoise::RATE)
+            .then(|| Box::new(VoiceFilter::new(spec.denoise)));
         // The filter works on one channel, and a voice needs no more.
         let wanted_ch = if filter.is_some() { 1 } else { spec.channels };
         let wire_ch = wanted_ch.clamp(1, 2).min(device.channels.max(1)) as usize;
@@ -118,9 +118,10 @@ impl Packetizer {
         self.packet_frames
     }
 
-    /// Whether the stream is being reduced to speech.
-    pub fn filtered(&self) -> bool {
-        self.filter.is_some()
+    /// How the stream is being filtered, which is not at all if the device
+    /// runs at a rate the filter cannot take.
+    pub fn filtered(&self) -> denoise::Mode {
+        self.filter.as_ref().map_or(denoise::Mode::Off, |filter| filter.mode())
     }
 
     /// Takes interleaved device-format samples; sends every packet they complete.
@@ -191,7 +192,7 @@ mod tests {
             stream_id: 42,
             channels,
             packet_us,
-            denoise: false,
+            denoise: denoise::Mode::Off,
             auto_gain: false,
             gain_db: 0.0,
         }

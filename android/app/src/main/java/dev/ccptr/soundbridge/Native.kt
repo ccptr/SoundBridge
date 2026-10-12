@@ -19,6 +19,11 @@ object Native {
     const val SEND_MIC = 1
     const val SEND_SYSTEM = 2
 
+    /** The `denoise` argument: nothing, background noise, or all but speech. */
+    const val DENOISE_OFF = 0
+    const val DENOISE_REDUCE = 1
+    const val DENOISE_GATE = 2
+
     /** Any free jitter buffer size; the engine sizes it from the network. */
     const val BUFFER_AUTO = -1
 
@@ -29,13 +34,16 @@ object Native {
 
     /**
      * Returns a handle, or 0 if no network socket could be opened. [denoise]
-     * sends only speech from the microphone; [autoGain] brings it to a steady
-     * level, and [gainDb] is added to that, or is the whole gain without it.
+     * is one of the `DENOISE_` values for the microphone, and the `gate`
+     * arguments tune [DENOISE_GATE]: how far it looks ahead, how long it
+     * stays open after the voice, and how sure of a voice it must be (0..1).
+     * [autoGain] brings the microphone to a steady level, and [gainDb] is
+     * added to that, or is the whole gain without it.
      */
     @JvmStatic
     external fun start(
-        name: String, send: Int, denoise: Boolean, autoGain: Boolean, gainDb: Int, play: Boolean, bufferMs: Int,
-        listener: Listener,
+        name: String, send: Int, denoise: Int, gateLookaheadMs: Int, gateHoldMs: Int, gateThreshold: Float,
+        autoGain: Boolean, gainDb: Int, play: Boolean, bufferMs: Int, listener: Listener,
     ): Long
 
     /** Hangs up, stops the engine and waits for its thread to finish. */
@@ -44,8 +52,8 @@ object Native {
 
     @JvmStatic
     external fun configure(
-        handle: Long, name: String, send: Int, denoise: Boolean, autoGain: Boolean, gainDb: Int, play: Boolean,
-        bufferMs: Int,
+        handle: Long, name: String, send: Int, denoise: Int, gateLookaheadMs: Int, gateHoldMs: Int,
+        gateThreshold: Float, autoGain: Boolean, gainDb: Int, play: Boolean, bufferMs: Int,
     )
 
     /** [host] should be an IP literal: a name would be resolved on the calling thread. */

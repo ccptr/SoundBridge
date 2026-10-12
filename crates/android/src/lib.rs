@@ -15,11 +15,16 @@ use std::sync::Arc;
 
 use jni::JNIEnv;
 use jni::objects::{JByteBuffer, JClass, JObject, JString, JValue};
-use jni::sys::{jboolean, jint, jlong};
+use jni::sys::{jboolean, jfloat, jint, jlong};
+use soundbridge_core::denoise::{Gate, Mode};
 use soundbridge_core::{
     BufferMode, Config, DEFAULT_PORT, Engine, Event, SinkConfig, SinkKind, SourceConfig,
     SourceKind, State,
 };
+
+/// The `denoise` argument; anything else is off.
+const DENOISE_REDUCE: jint = 1;
+const DENOISE_GATE: jint = 2;
 
 /// Bits of the `send` argument: any combination of sources.
 const SEND_MIC: jint = 1;
@@ -41,9 +46,21 @@ fn log_error(message: &str) {
 /// What the app chose for the microphone.
 #[derive(Clone, Copy)]
 struct Mic {
-    denoise: bool,
+    denoise: Mode,
     auto_gain: bool,
     gain_db: jint,
+}
+
+/// `mode` is one of the app's `Native.DENOISE_*`; the rest tunes the gate.
+fn denoise_mode(mode: jint, lookahead_ms: jint, hold_ms: jint, threshold: jfloat) -> Mode {
+    match mode {
+        DENOISE_REDUCE => Mode::Reduce,
+        DENOISE_GATE => {
+            Mode::Gate(Gate { lookahead_ms: lookahead_ms.max(0) as u32, hold_ms: hold_ms.max(0) as u32, threshold })
+                .clamped()
+        }
+        _ => Mode::Off,
+    }
 }
 
 fn config(name: String, send: jint, mic: Mic, play: bool, buffer_ms: jint) -> Config {
@@ -150,7 +167,11 @@ fn event_json(event: &Event) -> String {
                     tx.format.sample_rate,
                     tx.format.channels,
                     num(tx.level),
-                    tx.denoise
+                    match tx.denoise {
+                        Mode::Off => r#""off""#,
+                        Mode::Reduce => r#""reduce""#,
+                        Mode::Gate(_) => r#""gate""#,
+                    }
                 );
                 if let Some(remote) = &tx.remote {
                     let _ = write!(
@@ -203,7 +224,10 @@ pub extern "system" fn Java_dev_ccptr_soundbridge_Native_start<'l>(
     _class: JClass<'l>,
     name: JString<'l>,
     send: jint,
-    denoise: jboolean,
+    denoise: jint,
+    gate_lookahead_ms: jint,
+    gate_hold_ms: jint,
+    gate_threshold: jfloat,
     auto_gain: jboolean,
     gain_db: jint,
     play: jboolean,
@@ -230,7 +254,8 @@ pub extern "system" fn Java_dev_ccptr_soundbridge_Native_start<'l>(
             let _ = env.exception_clear();
         }
     };
-    let mic = Mic { denoise: denoise != 0, auto_gain: auto_gain != 0, gain_db };
+    let denoise = denoise_mode(denoise, gate_lookahead_ms, gate_hold_ms, gate_threshold);
+    let mic = Mic { denoise, auto_gain: auto_gain != 0, gain_db };
     let config = config(name, send, mic, play != 0, buffer_ms);
     match Engine::start(config, Arc::new(aaudio::AAudioBackend), on_event) {
         Ok(engine) => Box::into_raw(Box::new(engine)) as jlong,
@@ -266,7 +291,10 @@ pub extern "system" fn Java_dev_ccptr_soundbridge_Native_configure<'l>(
     handle: jlong,
     name: JString<'l>,
     send: jint,
-    denoise: jboolean,
+    denoise: jint,
+    gate_lookahead_ms: jint,
+    gate_hold_ms: jint,
+    gate_threshold: jfloat,
     auto_gain: jboolean,
     gain_db: jint,
     play: jboolean,
@@ -274,7 +302,8 @@ pub extern "system" fn Java_dev_ccptr_soundbridge_Native_configure<'l>(
 ) {
     let name = string(&mut env, &name);
     if let Some(engine) = engine(handle) {
-        let mic = Mic { denoise: denoise != 0, auto_gain: auto_gain != 0, gain_db };
+        let denoise = denoise_mode(denoise, gate_lookahead_ms, gate_hold_ms, gate_threshold);
+        let mic = Mic { denoise, auto_gain: auto_gain != 0, gain_db };
         engine.configure(config(name, send, mic, play != 0, buffer_ms));
     }
 }

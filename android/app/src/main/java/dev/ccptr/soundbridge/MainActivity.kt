@@ -186,15 +186,7 @@ private fun Screen() {
             Section("Send from this phone") {
                 Toggle("Microphone", state.settings.sendMic, setMicrophone)
                 if (state.settings.sendMic) {
-                    Toggle("Voice only", state.settings.denoise) { on -> Bridge.update { it.copy(denoise = on) } }
-                    Hint(
-                        if (state.settings.denoise) {
-                            "Typing, mouse clicks, breathing and background noise are removed. " +
-                                "Adds about 50 ms of delay."
-                        } else {
-                            "Removes everything but speech: for a phone on the desk next to a keyboard."
-                        },
-                    )
+                    DenoiseChoices(state.settings)
                     Toggle("Automatic level", state.settings.autoGain) { on ->
                         Bridge.update { it.copy(autoGain = on) }
                     }
@@ -244,6 +236,81 @@ private fun Screen() {
                 )
             }
         }
+    }
+}
+
+/**
+ * What a microphone can be filtered down to, with the gate each preset
+ * stands for. The names are as long as four in a row have room for.
+ */
+private val denoisePresets = listOf(
+    Triple(Native.DENOISE_OFF, null, "All"),
+    Triple(Native.DENOISE_REDUCE, null, "Cleaner"),
+    Triple(Native.DENOISE_GATE, Gate.VOICE, "Voice"),
+    Triple(Native.DENOISE_GATE, Gate.WHOLE_WORDS, "Voice+"),
+)
+
+/** The presets and, with the gate on, each of its settings. */
+@Composable
+private fun DenoiseChoices(settings: Settings) {
+    val gate = settings.gate
+    // A tuning that is none of the presets leaves all of them unlit.
+    val preset = denoisePresets.indexOfFirst { (mode, tuning, _) ->
+        mode == settings.denoise && (tuning == null || tuning == gate)
+    }
+    Choices(
+        options = denoisePresets.mapIndexed { index, (_, _, label) -> index to label },
+        selected = preset,
+        onSelect = { index ->
+            val (mode, tuning, _) = denoisePresets[index]
+            Bridge.update { it.copy(denoise = mode, gate = tuning ?: it.gate) }
+        },
+    )
+    when (settings.denoise) {
+        Native.DENOISE_REDUCE -> Hint(
+            "Cleaner: background noise is taken out from under the voice and nothing is cut off. " +
+                "Typing and clicks still come through in part. Adds about 10 ms of delay.",
+        )
+        Native.DENOISE_GATE -> {
+            val tune = { change: (Gate) -> Gate -> Bridge.update { it.copy(gate = change(it.gate)) } }
+            Hint(
+                when (denoisePresets.getOrNull(preset)?.second) {
+                    Gate.VOICE -> "Voice only, with the least delay. "
+                    Gate.WHOLE_WORDS -> "Voice only, keeping the start of a word after a pause. "
+                    else -> "Voice only, with your own tuning. "
+                } +
+                    "Typing, mouse clicks, breathing and background noise are removed. " +
+                    "Adds about ${gate.lookaheadMs + 10} ms of delay.",
+            )
+            Choices(
+                options = listOf(20 to "20 ms", 40 to "40 ms", 80 to "80 ms", 120 to "120 ms", 200 to "200 ms"),
+                selected = gate.lookaheadMs,
+                onSelect = { ms -> tune { it.copy(lookaheadMs = ms) } },
+            )
+            Hint(
+                "How far it listens ahead. More keeps the start of a word after a pause, " +
+                    "and delays the voice as much.",
+            )
+            Choices(
+                options = listOf(100 to "0.1 s", 250 to "0.25 s", 500 to "0.5 s", 1000 to "1 s"),
+                selected = gate.holdMs,
+                onSelect = { ms -> tune { it.copy(holdMs = ms) } },
+            )
+            Hint(
+                "How long it stays open after the voice stops. More bridges longer gaps, " +
+                    "and lets more noise trail a phrase.",
+            )
+            Choices(
+                options = listOf(0.7f to "Strict", 0.5f to "Normal", 0.3f to "Lenient"),
+                selected = gate.threshold,
+                onSelect = { level -> tune { it.copy(threshold = level) } },
+            )
+            Hint(
+                "How sure it must be that it hears a voice. Lenient opens for quiet speech, " +
+                    "and for more that is not speech.",
+            )
+        }
+        else -> Hint("Sent as the microphone hears it.")
     }
 }
 
@@ -364,7 +431,11 @@ private fun SessionCard(state: UiState) {
                 } else {
                     Text(
                         "Sending $name · ${formatOf(tx.rate, tx.channels)}" +
-                            if (tx.denoise) " · voice only" else "",
+                            when (tx.denoise) {
+                                "gate" -> " · voice only"
+                                "reduce" -> " · less noise"
+                                else -> ""
+                            },
                     )
                     Meter(tx.level)
                     val remote = tx.remote

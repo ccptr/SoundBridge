@@ -3,6 +3,8 @@
 
 use std::path::PathBuf;
 
+use soundbridge_core::denoise::Mode;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Kind {
     #[default]
@@ -11,13 +13,13 @@ pub enum Kind {
 }
 
 /// One stream this PC sends.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Source {
     pub kind: Kind,
     /// Device id; `None` follows the system default.
     pub device: Option<String>,
-    /// Send speech only. Offered for microphones.
-    pub denoise: bool,
+    /// What is filtered out. Offered for microphones.
+    pub denoise: Mode,
     /// Bring speech to a steady level. Offered for microphones.
     pub auto_gain: bool,
     /// Gain in dB, on top of the automatic one or on its own.
@@ -94,7 +96,8 @@ impl Settings {
             };
             match key {
                 // kind|denoise[,auto gain,gain]|device; the device comes last as it
-                // may hold anything. Files from before there was gain lack the rest.
+                // may hold anything. Files from before there was gain lack the rest,
+                // and ones from when voice only was all there was say 1 for it.
                 "source" => {
                     let mut fields = value.splitn(3, '|');
                     let kind = match fields.next() {
@@ -103,7 +106,11 @@ impl Settings {
                         _ => continue,
                     };
                     let mut flags = fields.next().unwrap_or_default().split(',');
-                    let denoise = flags.next() == Some("1");
+                    let denoise = match flags.next() {
+                        Some("1") => Mode::VOICE,
+                        Some(mode) => mode.parse().unwrap_or_default(),
+                        None => Mode::Off,
+                    };
                     let auto_gain = flags.next() == Some("1");
                     let gain_db = flags.next().and_then(|db| db.parse().ok()).unwrap_or(0);
                     let device = fields.next().and_then(device);
@@ -136,7 +143,7 @@ impl Settings {
             };
             out += &format!(
                 "source={kind}|{},{},{}|{}\n",
-                source.denoise as u8,
+                source.denoise,
                 source.auto_gain as u8,
                 source.gain_db,
                 device(&source.device)
@@ -157,12 +164,18 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soundbridge_core::denoise::Gate;
 
     #[test]
     fn round_trips() {
         let settings = Settings {
             sources: vec![
-                Source { kind: Kind::Mic, denoise: true, auto_gain: true, gain_db: -6, ..Source::default() },
+                Source { kind: Kind::Mic, denoise: Mode::Reduce, auto_gain: true, gain_db: -6, ..Source::default() },
+                Source {
+                    kind: Kind::Mic,
+                    denoise: Mode::Gate(Gate { lookahead_ms: 80, hold_ms: 500, threshold: 0.3 }),
+                    ..Source::default()
+                },
                 Source {
                     kind: Kind::System,
                     device: Some("pipewire:alsa_output.pci-0000_0e_00.4|x".into()),
@@ -187,8 +200,20 @@ mod tests {
     #[test]
     fn reads_sources_saved_before_there_was_gain() {
         let s = Settings::parse("source=mic|1|pipewire:a|b\nsource=system|0|\n");
-        let mic = Source { kind: Kind::Mic, device: Some("pipewire:a|b".into()), denoise: true, ..Source::default() };
+        let mic = Source {
+            kind: Kind::Mic,
+            device: Some("pipewire:a|b".into()),
+            denoise: Mode::VOICE,
+            ..Source::default()
+        };
         assert_eq!(s.sources, [mic, Source { kind: Kind::System, ..Source::default() }]);
+    }
+
+    #[test]
+    fn reads_sources_saved_when_voice_only_was_a_switch() {
+        let s = Settings::parse("source=mic|1,1,-6|\nsource=mic|0,0,0|\n");
+        let filtered = Source { denoise: Mode::VOICE, auto_gain: true, gain_db: -6, ..Source::default() };
+        assert_eq!(s.sources, [filtered, Source::default()]);
     }
 
     #[test]

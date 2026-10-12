@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use soundbridge_core::cpal_backend::CpalBackend;
+use soundbridge_core::denoise::{Gate, Mode};
 use soundbridge_core::gain::OFFSET_RANGE_DB;
 use soundbridge_core::{
     AudioBackend, BufferMode, Config, DEFAULT_PORT, DeviceDirection, Engine, Event, SinkConfig,
@@ -44,6 +45,14 @@ Examples:
 
   Send a headset mic, voice only, and what this PC is playing:
     soundbridge connect 192.168.1.20 --send mic=ID --send system --denoise
+
+  Voice only without losing the start of a word after a pause, at more delay:
+    soundbridge connect 192.168.1.20 --send mic --denoise=whole
+
+  The same with a tuning of your own: the gate opens more readily and stays
+  open longer:
+    soundbridge connect 192.168.1.20 --send mic --denoise --gate-lookahead 80 \
+        --gate-hold 400 --gate-threshold 0.4
 
   Send a quiet microphone at a normal level, a little below the usual:
     soundbridge connect 192.168.1.20 --send mic --auto-gain --gain -3";
@@ -145,10 +154,31 @@ struct LinkArgs {
     /// Channels to send [default: 1 for mic, 2 for system]
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..=2))]
     channels: Option<u16>,
-    /// Send only speech from microphones: typing, mouse clicks, breathing
-    /// and background noise are removed. Adds about 50 ms of delay
-    #[arg(long)]
-    denoise: bool,
+    /// Filter microphones. `reduce` takes background noise out from under
+    /// the voice and cuts nothing off (about 10 ms of delay). `voice` also
+    /// shuts the stream between phrases, which removes typing, mouse clicks
+    /// and breathing (50 ms; can clip the start of a word after a pause).
+    /// `whole` is `voice` listening further ahead, which keeps those starts
+    /// (130 ms). The --gate options tune `voice` and `whole` further
+    #[arg(long, value_name = "MODE", num_args = 0..=1, require_equals = true,
+          default_missing_value = "voice")]
+    denoise: Option<Mode>,
+    /// How far the gate looks ahead of the voice that opens it, ms: more
+    /// keeps more of a word's start, and delays the stream as much
+    /// [default: 40, or 120 with --denoise=whole]
+    #[arg(long, value_name = "MS", requires = "denoise",
+          value_parser = clap::value_parser!(u32).range(0..=Gate::MAX_LOOKAHEAD_MS as i64))]
+    gate_lookahead: Option<u32>,
+    /// How long the gate stays open after the voice stops, ms: more bridges
+    /// longer gaps, and lets more noise trail a phrase [default: 250]
+    #[arg(long, value_name = "MS", requires = "denoise",
+          value_parser = clap::value_parser!(u32).range(10..=Gate::MAX_HOLD_MS as i64))]
+    gate_hold: Option<u32>,
+    /// How sure the gate must be that it hears a voice, 0.05 to 0.95: lower
+    /// opens for quieter speech, and for more that is not speech
+    /// [default: 0.5]
+    #[arg(long, value_name = "LEVEL", requires = "denoise", value_parser = parse_threshold)]
+    gate_threshold: Option<f32>,
     /// Bring speech from microphones to a steady level, however quiet or
     /// loud the microphone is. A limiter keeps it from clipping
     #[arg(long)]
@@ -212,6 +242,17 @@ fn parse_gain(s: &str) -> Result<f32, String> {
     }
 }
 
+fn parse_threshold(s: &str) -> Result<f32, String> {
+    match s.parse::<f32>() {
+        Ok(level) if Gate::THRESHOLDS.contains(&level) => Ok(level),
+        _ => Err(format!(
+            "expected a level between {} and {}, e.g. `0.4`",
+            Gate::THRESHOLDS.start(),
+            Gate::THRESHOLDS.end()
+        )),
+    }
+}
+
 fn parse_buffer(s: &str) -> Result<Buffer, String> {
     if s.eq_ignore_ascii_case("auto") {
         return Ok(Buffer::Auto);
@@ -223,6 +264,25 @@ fn parse_buffer(s: &str) -> Result<Buffer, String> {
 }
 
 impl LinkArgs {
+    /// The filter for microphones: the chosen mode, with any --gate options
+    /// laid over its gate. Those alone make a gate of a mode without one.
+    fn denoise(&self) -> Mode {
+        let mode = self.denoise.unwrap_or_default();
+        if self.gate_lookahead.is_none() && self.gate_hold.is_none() && self.gate_threshold.is_none() {
+            return mode;
+        }
+        let gate = match mode {
+            Mode::Gate(gate) => gate,
+            _ => Gate::VOICE,
+        };
+        Mode::Gate(Gate {
+            lookahead_ms: self.gate_lookahead.unwrap_or(gate.lookahead_ms),
+            hold_ms: self.gate_hold.unwrap_or(gate.hold_ms),
+            threshold: self.gate_threshold.unwrap_or(gate.threshold),
+        })
+        .clamped()
+    }
+
     fn config(&self, port: u16, listen: bool) -> Config {
         Config {
             name: self.name.clone().unwrap_or_else(soundbridge_core::default_name),
@@ -235,7 +295,7 @@ impl LinkArgs {
                     kind: source.kind,
                     device: source.device.clone(),
                     channels: self.channels,
-                    denoise: self.denoise && source.kind == SourceKind::Mic,
+                    denoise: if source.kind == SourceKind::Mic { self.denoise() } else { Mode::Off },
                     auto_gain: self.auto_gain && source.kind == SourceKind::Mic,
                     gain_db: if source.kind == SourceKind::Mic { self.gain } else { 0.0 },
                 })
@@ -443,7 +503,11 @@ impl Status {
         let brief = stats.tx.len() > 1 || stats.rx.len() > 1;
         let mut parts = Vec::new();
         for tx in &stats.tx {
-            let filtered = if tx.denoise { " voice only" } else { "" };
+            let filtered = match tx.denoise {
+                Mode::Off => "",
+                Mode::Reduce => " less noise",
+                Mode::Gate(_) => " voice only",
+            };
             let mut part = format!("send {}{filtered} {}", stream(tx.kind, tx.format, brief), meter(tx.level));
             if let Some(remote) = tx.remote.filter(|_| !brief) {
                 part += &format!(" > peer buffer {:.1} ms", remote.buffer_us as f32 / 1000.0);
@@ -568,7 +632,7 @@ mod tests {
         let Command::Listen { link, .. } = cli.command else { panic!() };
         let config = link.config(0, true);
         let sent: Vec<_> = config.send.iter().map(|s| (s.kind, s.denoise)).collect();
-        assert_eq!(sent, [(SourceKind::Mic, true), (SourceKind::System, false)]);
+        assert_eq!(sent, [(SourceKind::Mic, Mode::VOICE), (SourceKind::System, Mode::Off)]);
         let played: Vec<_> = config.play.iter().map(|s| (s.from, s.kind)).collect();
         assert_eq!(
             played,
@@ -581,6 +645,30 @@ mod tests {
         let config = link.config(0, false);
         assert!(config.send.is_empty());
         assert_eq!(config.play, [SinkConfig::new(SinkKind::Speaker)]);
+    }
+
+    #[test]
+    fn denoise_presets_and_tuning() {
+        let denoise = |args: &[&str]| {
+            let args = ["soundbridge", "connect", "host", "--send", "mic"].iter().chain(args);
+            let Command::Connect { link, .. } = Cli::try_parse_from(args)?.command else { panic!() };
+            Ok::<_, clap::Error>(link.config(0, false).send[0].denoise)
+        };
+        assert_eq!(denoise(&[]).unwrap(), Mode::Off);
+        assert_eq!(denoise(&["--denoise"]).unwrap(), Mode::VOICE);
+        assert_eq!(denoise(&["--denoise=reduce"]).unwrap(), Mode::Reduce);
+        assert_eq!(denoise(&["--denoise=whole"]).unwrap(), Mode::WHOLE_WORDS);
+        assert_eq!(
+            denoise(&["--denoise=whole", "--gate-hold", "400", "--gate-threshold", "0.4"]).unwrap(),
+            Mode::Gate(Gate { hold_ms: 400, threshold: 0.4, ..Gate::WHOLE_WORDS })
+        );
+        assert_eq!(
+            denoise(&["--denoise", "--gate-lookahead", "85"]).unwrap(),
+            Mode::Gate(Gate { lookahead_ms: 80, ..Gate::VOICE })
+        );
+        assert!(denoise(&["--denoise=loud"]).is_err());
+        assert!(denoise(&["--gate-hold", "400"]).is_err());
+        assert!(denoise(&["--denoise", "--gate-threshold", "2"]).is_err());
     }
 
     #[test]

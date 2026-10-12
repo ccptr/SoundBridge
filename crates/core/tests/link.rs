@@ -7,6 +7,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use soundbridge_core::audio::{MakeCapture, MakeRender};
+use soundbridge_core::denoise;
 use soundbridge_core::{
     AudioBackend, CaptureRequest, Config, DeviceInfo, Engine, Event, PlaybackRequest, SinkConfig,
     SinkKind, SourceConfig, SourceKind, State, Stats, StreamHandle,
@@ -196,7 +197,7 @@ fn a_filtered_source_is_sent_as_mono_speech() {
         engine(Config { play: vec![SinkConfig::new(SinkKind::Null)], ..config("listener") });
     let (dialer, dialer_events) = engine(Config {
         // Asked for in stereo and at another rate; the filter overrides both.
-        send: vec![SourceConfig { denoise: true, ..tone_source(2) }],
+        send: vec![SourceConfig { denoise: denoise::Mode::VOICE, ..tone_source(2) }],
         sample_rate: 44_100,
         ..config("dialer")
     });
@@ -206,7 +207,7 @@ fn a_filtered_source_is_sent_as_mono_speech() {
         Event::Info(text) => panic!("{text}"),
         _ => None,
     });
-    assert!(tx.denoise);
+    assert_eq!(tx.denoise, denoise::Mode::VOICE);
     assert_eq!((tx.format.sample_rate, tx.format.channels), (48_000, 1));
     // One packet per frame of the filter.
     assert_eq!(tx.packet_ms, 10.0);
@@ -397,7 +398,7 @@ fn a_microphone_at_the_wrong_rate_is_sent_unfiltered_and_says_so() {
     let (tx, events) = mpsc::channel();
     let dialer = Engine::start(
         Config {
-            send: vec![SourceConfig { denoise: true, ..SourceConfig::new(SourceKind::Mic) }],
+            send: vec![SourceConfig { denoise: denoise::Mode::VOICE, ..SourceConfig::new(SourceKind::Mic) }],
             ..config("dialer")
         },
         mic,
@@ -416,5 +417,5 @@ fn a_microphone_at_the_wrong_rate_is_sent_unfiltered_and_says_so() {
         Event::Stats(Stats { tx, .. }) => tx.first().copied(),
         _ => None,
     });
-    assert!(!tx.denoise);
+    assert_eq!(tx.denoise, denoise::Mode::Off);
 }

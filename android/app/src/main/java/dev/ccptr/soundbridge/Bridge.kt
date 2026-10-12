@@ -17,10 +17,33 @@ import java.util.concurrent.Executors
 
 const val DEFAULT_PORT = 47800
 
+/** How the gate of [Native.DENOISE_GATE] is tuned. */
+data class Gate(
+    /** How far it looks ahead of the voice that opens it, which is as much delay. */
+    val lookaheadMs: Int,
+    /** How long it stays open after the voice stops. */
+    val holdMs: Int,
+    /** How sure of a voice it must be, 0..1. */
+    val threshold: Float,
+) {
+    companion object {
+        /** The least delay; a word after a pause can lose its first sound. */
+        val VOICE = Gate(lookaheadMs = 40, holdMs = 250, threshold = 0.5f)
+
+        /** Looks far enough ahead to keep the start of such a word. */
+        val WHOLE_WORDS = VOICE.copy(lookaheadMs = 120)
+    }
+}
+
 data class Settings(
     val sendMic: Boolean = false,
-    /** Send only speech from the microphone: no typing, clicks or breathing. */
-    val denoise: Boolean = false,
+    /**
+     * What is filtered out of the microphone, a `Native.DENOISE_` value:
+     * nothing, background noise, or everything but speech.
+     */
+    val denoise: Int = Native.DENOISE_OFF,
+    /** Kept while the gate is off, so a tuning survives a look at the other modes. */
+    val gate: Gate = Gate.VOICE,
     /**
      * Bring speech to a steady level. On unless switched off: a phone's
      * microphone is far too quiet as it comes.
@@ -60,7 +83,8 @@ data class TxStats(
     val rate: Int,
     val channels: Int,
     val level: Float,
-    val denoise: Boolean,
+    /** "off", "reduce" or "gate". */
+    val denoise: String,
     val remote: RemoteStats?,
 )
 
@@ -127,7 +151,16 @@ object Bridge : Native.Listener {
             // is not restored. ("send" is how the choice was stored before
             // there could be several.)
             sendMic = prefs.getBoolean("sendMic", prefs.getInt("send", 0) == 1),
-            denoise = prefs.getBoolean("denoise", false),
+            // "denoise" is the switch that voice only was before there were modes.
+            denoise = prefs.getInt(
+                "denoiseMode",
+                if (prefs.getBoolean("denoise", false)) Native.DENOISE_GATE else Native.DENOISE_OFF,
+            ),
+            gate = Gate(
+                lookaheadMs = prefs.getInt("gateLookaheadMs", Gate.VOICE.lookaheadMs),
+                holdMs = prefs.getInt("gateHoldMs", Gate.VOICE.holdMs),
+                threshold = prefs.getFloat("gateThreshold", Gate.VOICE.threshold),
+            ),
             autoGain = prefs.getBoolean("autoGain", true),
             gainDb = prefs.getInt("gainDb", 0),
             play = prefs.getBoolean("play", true),
@@ -149,7 +182,11 @@ object Bridge : Native.Listener {
         _state.update { it.copy(settings = new) }
         app.getSharedPreferences("settings", Context.MODE_PRIVATE).edit {
             putBoolean("sendMic", new.sendMic)
-            putBoolean("denoise", new.denoise)
+            remove("denoise")
+            putInt("denoiseMode", new.denoise)
+            putInt("gateLookaheadMs", new.gate.lookaheadMs)
+            putInt("gateHoldMs", new.gate.holdMs)
+            putFloat("gateThreshold", new.gate.threshold)
             putBoolean("autoGain", new.autoGain)
             putInt("gainDb", new.gainDb)
             putBoolean("play", new.play)
@@ -161,7 +198,8 @@ object Bridge : Native.Listener {
         }
         if (handle != 0L) {
             Native.configure(
-                handle, deviceName, new.sendFlags, new.denoise, new.autoGain, new.gainDb, new.play, new.bufferMs,
+                handle, deviceName, new.sendFlags, new.denoise, new.gate.lookaheadMs, new.gate.holdMs,
+                new.gate.threshold, new.autoGain, new.gainDb, new.play, new.bufferMs,
             )
         }
         reconcile()
@@ -226,7 +264,10 @@ object Bridge : Native.Listener {
             acquire()
         }
         val s = _state.value.settings
-        handle = Native.start(deviceName, s.sendFlags, s.denoise, s.autoGain, s.gainDb, s.play, s.bufferMs, this)
+        handle = Native.start(
+            deviceName, s.sendFlags, s.denoise, s.gate.lookaheadMs, s.gate.holdMs, s.gate.threshold, s.autoGain,
+            s.gainDb, s.play, s.bufferMs, this,
+        )
         _state.update { it.copy(online = handle != 0L, peers = emptyList()) }
         if (handle == 0L) notice("Could not open a network socket", error = true)
     }
@@ -288,7 +329,7 @@ object Bridge : Native.Listener {
                 rate = it.optInt("rate"),
                 channels = it.optInt("channels"),
                 level = it.optDouble("level").toFloat(),
-                denoise = it.optBoolean("denoise"),
+                denoise = it.optString("denoise", "off"),
                 remote = it.optJSONObject("remote")?.let { r ->
                     RemoteStats(
                         playing = r.optBoolean("playing"),

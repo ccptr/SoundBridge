@@ -37,6 +37,7 @@ soundbridge discover                           # who is listening?
 soundbridge devices                            # device ids for --send mic=ID / --play speaker=ID
 soundbridge listen --play mic:virtual-mic --play system:speaker   # each kind of stream somewhere else
 soundbridge connect HOST --send mic --send system --denoise      # two streams; the mic voice only
+soundbridge connect HOST --send mic --denoise=whole              # voice only, keeping the start of every word
 soundbridge listen --play null                 # link test without sound:
 soundbridge connect HOST --send tone --play none
 ```
@@ -51,10 +52,27 @@ apps, `--denoise` on the command line), for a phone lying on the desk next to
 a keyboard: typing, mouse clicks, breathing and background noise are removed,
 and between phrases the stream is silent. RNNoise takes the noise out from
 under the voice, and a gate that opens only for pitched speech shuts out the
-rest. It runs on the sending end, costs 50 to 60 ms of delay and about a
-percent of a desktop core, and needs the microphone to run at 48 kHz (it is
-sent unfiltered otherwise). Anything with a voice or a pitch of its own still
-gets through: other people talking, music, a steady hum.
+rest. It runs on the sending end, costs about a percent of a desktop core,
+and needs the microphone to run at 48 kHz (it is sent unfiltered otherwise).
+Anything with a voice or a pitch of its own still gets through: other people
+talking, music, a steady hum.
+
+How much is filtered is a choice between presets, and the gate behind the
+last two can be tuned from there:
+
+| Preset | `--denoise=` | What it does | Delay |
+|---|---|---|---|
+| Less noise | `reduce` | RNNoise without the gate: background noise goes, nothing is ever cut off, typing and clicks come through in part | 10 to 20 ms |
+| Voice only | `voice` (or bare `--denoise`) | The gate, looking 40 ms ahead. A word that starts unvoiced after a pause ("s", "f", "h") can lose its first sound | 50 to 60 ms |
+| Whole words | `whole` | The gate, looking 120 ms ahead, which keeps those starts | 130 to 140 ms |
+
+| Gate setting | Option | Presets | More of it |
+|---|---|---|---|
+| Look-ahead | `--gate-lookahead MS`, 0 to 200 | 40, 120 | keeps more of the start of a word, and delays the voice as much |
+| Hold | `--gate-hold MS`, 10 to 2000 | 250 | bridges longer gaps in speech, and lets more noise trail a phrase |
+| Threshold | `--gate-threshold LEVEL`, 0.05 to 0.95 | 0.5 | shuts out more that is not speech, and more quiet speech with it |
+
+The apps offer a few steps of each; the command line takes any value.
 
 ### Microphone level
 

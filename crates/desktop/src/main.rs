@@ -17,6 +17,7 @@ use gpui::{
     TitlebarOptions, Window, WindowBounds, WindowOptions, div, prelude::*, px, relative, rgb, size,
 };
 use soundbridge_core::cpal_backend::CpalBackend;
+use soundbridge_core::denoise::{Gate, Mode};
 use soundbridge_core::{
     AudioBackend, BufferMode, Config, DEFAULT_PORT, DeviceDirection, DeviceInfo, Engine, Event,
     Peer, SinkConfig, SinkKind, SourceConfig, SourceKind, State, Stats,
@@ -25,6 +26,18 @@ use soundbridge_core::{
 use settings::{Kind, Play, Route, Settings, Source};
 use text_input::{Submitted, TextInput};
 
+/// What a microphone can be filtered down to. A tuning that is none of
+/// these leaves all of them unlit.
+const DENOISE_CHOICES: [(Mode, &str); 4] = [
+    (Mode::Off, "Everything"),
+    (Mode::Reduce, "Less noise"),
+    (Mode::VOICE, "Voice only"),
+    (Mode::WHOLE_WORDS, "Whole words"),
+];
+const LOOKAHEAD_CHOICES: [(u32, &str); 5] =
+    [(20, "20 ms"), (40, "40 ms"), (80, "80 ms"), (120, "120 ms"), (200, "200 ms")];
+const HOLD_CHOICES: [(u32, &str); 4] = [(100, "0.1 s"), (250, "0.25 s"), (500, "0.5 s"), (1000, "1 s")];
+const THRESHOLD_CHOICES: [(f32, &str); 3] = [(0.7, "Strict"), (0.5, "Normal"), (0.3, "Lenient")];
 /// Jitter-buffer choices offered in the UI; `None` is automatic.
 const GAIN_CHOICES: [(i32, &str); 6] =
     [(-12, "-12 dB"), (-6, "-6 dB"), (0, "0 dB"), (6, "+6 dB"), (12, "+12 dB"), (24, "+24 dB")];
@@ -246,7 +259,7 @@ fn config(settings: &Settings) -> Config {
                 kind: wire_kind(source.kind),
                 device: source.device.clone(),
                 channels: None,
-                denoise: source.denoise && source.kind == Kind::Mic,
+                denoise: if source.kind == Kind::Mic { source.denoise } else { Mode::Off },
                 auto_gain: source.auto_gain && source.kind == Kind::Mic,
                 gain_db: if source.kind == Kind::Mic { source.gain_db as f32 } else { 0.0 },
             })
@@ -522,21 +535,83 @@ impl Bridge {
                 .child(self.device_picker(Picker::Source(index), &source.device, direction, cx));
             block = match source.kind {
                 Kind::Mic => {
-                    let options = [(false, "Everything it hears"), (true, "Voice only")];
-                    let pick = cx.listener(move |this, &voice_only: &bool, _, cx| {
+                    let pick = cx.listener(move |this, &mode: &Mode, _, cx| {
                         if let Some(source) = this.settings.sources.get_mut(index) {
-                            source.denoise = voice_only;
+                            source.denoise = mode;
                         }
                         this.open_picker = None;
                         this.settings_changed(cx);
                     });
-                    let block = block.child(segmented(("denoise", index), &options, source.denoise, pick));
+                    let block = block.child(segmented(("denoise", index), &DENOISE_CHOICES, source.denoise, pick));
+                    let delay = source.denoise.delay_ms();
                     let block = match source.denoise {
-                        true => block.child(detail(
-                            "Typing, mouse clicks, breathing and background noise are removed. \
-                             Adds about 50 ms of delay.",
-                        )),
-                        false => block,
+                        Mode::Off => block,
+                        Mode::Reduce => block.child(detail(format!(
+                            "Background noise is taken out from under the voice and nothing is cut off. \
+                             Typing and clicks still come through in part. Adds about {delay} ms of delay."
+                        ))),
+                        Mode::Gate(gate) => {
+                            // Each row changes one thing about the gate.
+                            let tune = |id: &'static str,
+                                        options: &[(f32, &'static str)],
+                                        current: f32,
+                                        set: fn(&mut Gate, f32),
+                                        cx: &mut Context<Self>| {
+                                let pick = cx.listener(move |this, &value: &f32, _, cx| {
+                                    if let Some(Source { denoise: Mode::Gate(gate), .. }) =
+                                        this.settings.sources.get_mut(index)
+                                    {
+                                        set(gate, value);
+                                    }
+                                    this.open_picker = None;
+                                    this.settings_changed(cx);
+                                });
+                                segmented((id, index), options, current, pick)
+                            };
+                            let ms = |choices: &[(u32, &'static str)]| -> Vec<(f32, &'static str)> {
+                                choices.iter().map(|&(ms, label)| (ms as f32, label)).collect()
+                            };
+                            let tuned = !DENOISE_CHOICES.iter().any(|&(mode, _)| mode == source.denoise);
+                            block
+                                .child(detail(format!(
+                                    "{}Typing, mouse clicks, breathing and background noise are removed. \
+                                     Adds about {delay} ms of delay.",
+                                    if tuned { "Your own tuning. " } else { "" }
+                                )))
+                                .child(tune(
+                                    "gate-lookahead",
+                                    &ms(&LOOKAHEAD_CHOICES),
+                                    gate.lookahead_ms as f32,
+                                    |gate, ms| gate.lookahead_ms = ms as u32,
+                                    cx,
+                                ))
+                                .child(detail(
+                                    "How far it listens ahead. More keeps the start of a word after a pause, \
+                                     and delays the voice as much.",
+                                ))
+                                .child(tune(
+                                    "gate-hold",
+                                    &ms(&HOLD_CHOICES),
+                                    gate.hold_ms as f32,
+                                    |gate, ms| gate.hold_ms = ms as u32,
+                                    cx,
+                                ))
+                                .child(detail(
+                                    "How long it stays open after the voice stops. More bridges longer gaps, \
+                                     and lets more noise trail a phrase.",
+                                ))
+                                .child(tune(
+                                    "gate-threshold",
+                                    &THRESHOLD_CHOICES,
+                                    gate.threshold,
+                                    |gate, level| gate.threshold = level,
+                                    cx,
+                                ))
+                                .child(detail(
+                                    "How sure it must be that it hears a voice. Lenient opens for quiet speech, \
+                                     and for more that is not speech.",
+                                ))
+                        }
                     };
                     let options = [(false, "Level as it is"), (true, "Automatic level")];
                     let pick = cx.listener(move |this, &auto_gain: &bool, _, cx| {
@@ -700,7 +775,11 @@ impl Bridge {
                     Some(_) => "The other end is buffering".to_string(),
                     None => "The other end is not playing it".to_string(),
                 };
-                let filtered = if tx.denoise { " · voice only" } else { "" };
+                let filtered = match tx.denoise {
+                    Mode::Off => "",
+                    Mode::Reduce => " · less noise",
+                    Mode::Gate(_) => " · voice only",
+                };
                 section = section.child(
                     div()
                         .flex()
