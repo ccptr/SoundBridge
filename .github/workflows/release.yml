@@ -1,8 +1,8 @@
 name: Release artifacts
 
-# Builds the Android APKs and the Linux binaries and attaches them to a
-# release when it is published. It can also be run by hand for an existing
-# release, to rebuild its files.
+# Builds the Android APKs and the Linux and Windows binaries and attaches them
+# to a release when it is published. It can also be run by hand for an
+# existing release, to rebuild its files.
 on:
   release:
     types: [published]
@@ -92,3 +92,41 @@ jobs:
           cp target/release/soundbridge target/release/soundbridge-desktop LICENSE README.md "$dir"
           tar -czf "$dir.tar.gz" "$dir"
           gh release upload "$TAG" --clobber "$dir.tar.gz"
+
+  windows:
+    name: Windows binaries
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Link the C runtime in, so the programs run without the Visual C++
+      # redistributable installed.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # gpui compiles its shaders with fxc.exe from the Windows SDK, and only
+      # looks for one SDK version on its own.
+      - name: Locate fxc.exe
+        run: |
+          fxc=$(find "/c/Program Files (x86)/Windows Kits/10/bin" -path '*/x64/fxc.exe' | sort -V | tail -n 1)
+          test -n "$fxc"
+          echo "GPUI_FXC_PATH=$(cygpath -w "$fxc")" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Attach to the release
+        run: |
+          dir="soundbridge-$TAG-windows-x86_64"
+          mkdir "$dir"
+          cp target/release/soundbridge.exe target/release/soundbridge-desktop.exe LICENSE README.md "$dir"
+          7z a "$dir.zip" "$dir"
+          gh release upload "$TAG" --clobber "$dir.zip"
