@@ -5,7 +5,8 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
-use crate::audio::StreamFormat;
+use crate::audio::{SourceKind, StreamFormat};
+use crate::denoise::{self, VoiceFilter};
 use crate::protocol::{AUDIO_HEADER_LEN, AudioHeader, CODEC_PCM16, MAX_DATAGRAM, write_audio_header};
 
 #[derive(Default)]
@@ -28,6 +29,19 @@ impl TxShared {
     }
 }
 
+/// What one outgoing stream is, as far as the wire is concerned.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamSpec {
+    pub slot: u8,
+    pub kind: SourceKind,
+    pub stream_id: u32,
+    /// Channels to put on the wire (1 or 2).
+    pub channels: u16,
+    pub packet_us: u32,
+    /// Send speech only. Takes effect if the device runs at [`denoise::RATE`].
+    pub denoise: bool,
+}
+
 /// Lives inside the capture callback. Sending happens right there rather
 /// than on a separate thread: a UDP send to a LAN peer is a few microseconds
 /// and effectively never blocks, whereas a hand-off would add a wake-up of
@@ -42,30 +56,40 @@ pub struct Packetizer {
     buf: Vec<u8>,
     filled: usize,
     shared: Arc<TxShared>,
+    filter: Option<Box<VoiceFilter>>,
 }
 
 impl Packetizer {
-    /// `device` is the format the callback will deliver; `channels` is how
-    /// many to put on the wire (1 or 2). Returns the resulting wire format.
+    /// `device` is the format the callback will deliver. Returns the
+    /// resulting wire format.
     pub fn new(
         socket: Arc<UdpSocket>,
         peer: SocketAddr,
-        stream_id: u32,
+        spec: StreamSpec,
         device: StreamFormat,
-        channels: u16,
-        packet_us: u32,
     ) -> (Packetizer, Arc<TxShared>, StreamFormat) {
-        let wire_ch = channels.clamp(1, 2).min(device.channels.max(1)) as usize;
+        let filter = (spec.denoise && device.sample_rate == denoise::RATE)
+            .then(|| Box::new(VoiceFilter::new()));
+        // The filter works on one channel, and a voice needs no more.
+        let wanted_ch = if filter.is_some() { 1 } else { spec.channels };
+        let wire_ch = wanted_ch.clamp(1, 2).min(device.channels.max(1)) as usize;
         let max_frames = (MAX_DATAGRAM - AUDIO_HEADER_LEN) / (2 * wire_ch);
-        let wanted = (device.sample_rate as u64 * packet_us as u64 / 1_000_000) as usize;
-        let packet_frames = wanted.clamp(16, max_frames);
+        let wanted = (device.sample_rate as u64 * spec.packet_us as u64 / 1_000_000) as usize;
+        let packet_frames = match &filter {
+            // The filter delivers a frame at a time; cutting that into
+            // smaller packets would only send them in bursts.
+            Some(_) => denoise::FRAME,
+            None => wanted.clamp(16, max_frames),
+        };
         let shared = Arc::new(TxShared::default());
         let wire = StreamFormat { sample_rate: device.sample_rate, channels: wire_ch as u16 };
         let packetizer = Packetizer {
             socket,
             peer,
             header: AudioHeader {
-                stream_id,
+                slot: spec.slot,
+                kind: spec.kind,
+                stream_id: spec.stream_id,
                 timestamp: 0,
                 sample_rate: device.sample_rate,
                 channels: wire_ch as u8,
@@ -77,6 +101,7 @@ impl Packetizer {
             buf: vec![0; AUDIO_HEADER_LEN + packet_frames * wire_ch * 2],
             filled: 0,
             shared: shared.clone(),
+            filter,
         };
         (packetizer, shared, wire)
     }
@@ -85,27 +110,49 @@ impl Packetizer {
         self.packet_frames
     }
 
+    /// Whether the stream is being reduced to speech.
+    pub fn filtered(&self) -> bool {
+        self.filter.is_some()
+    }
+
     /// Takes interleaved device-format samples; sends every packet they complete.
     pub fn push(&mut self, input: &[f32]) {
         let mut peak = 0.0f32;
+        // Taken out for the loop so its output can be handed to `put`.
+        let mut filter = self.filter.take();
         for frame in input.chunks_exact(self.device_ch) {
             let wire = match (self.device_ch, self.wire_ch) {
                 (1, _) => [frame[0], frame[0]],
                 (_, 1) => [0.5 * (frame[0] + frame[1]); 2],
                 _ => [frame[0], frame[1]],
             };
-            let at = AUDIO_HEADER_LEN + self.filled * self.wire_ch * 2;
-            for (c, v) in wire[..self.wire_ch].iter().enumerate() {
-                peak = peak.max(v.abs());
-                let s = (v.clamp(-1.0, 1.0) * 32767.0) as i16;
-                self.buf[at + c * 2..at + c * 2 + 2].copy_from_slice(&s.to_le_bytes());
-            }
-            self.filled += 1;
-            if self.filled == self.packet_frames {
-                self.flush();
+            match &mut filter {
+                None => peak = peak.max(self.put(wire)),
+                Some(filter) => {
+                    for &v in filter.push(wire[0]).into_iter().flatten() {
+                        peak = peak.max(self.put([v, v]));
+                    }
+                }
             }
         }
+        self.filter = filter;
         self.shared.peak.fetch_max(peak.min(1.0).to_bits(), Relaxed);
+    }
+
+    /// Queues one frame for the wire and returns its peak.
+    fn put(&mut self, frame: [f32; 2]) -> f32 {
+        let mut peak = 0.0f32;
+        let at = AUDIO_HEADER_LEN + self.filled * self.wire_ch * 2;
+        for (c, v) in frame[..self.wire_ch].iter().enumerate() {
+            peak = peak.max(v.abs());
+            let s = (v.clamp(-1.0, 1.0) * 32767.0) as i16;
+            self.buf[at + c * 2..at + c * 2 + 2].copy_from_slice(&s.to_le_bytes());
+        }
+        self.filled += 1;
+        if self.filled == self.packet_frames {
+            self.flush();
+        }
+        peak
     }
 
     fn flush(&mut self) {
@@ -125,14 +172,17 @@ mod tests {
     use crate::protocol::{Packet, decode};
     use std::time::Duration;
 
+    fn spec(channels: u16, packet_us: u32) -> StreamSpec {
+        StreamSpec { slot: 3, kind: SourceKind::Mic, stream_id: 42, channels, packet_us, denoise: false }
+    }
+
     #[test]
     fn packetizes_across_callback_boundaries() {
         let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
         rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let tx = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
         let device = StreamFormat { sample_rate: 48_000, channels: 2 };
-        let (mut p, shared, wire) =
-            Packetizer::new(tx, rx.local_addr().unwrap(), 42, device, 1, 2_500);
+        let (mut p, shared, wire) = Packetizer::new(tx, rx.local_addr().unwrap(), spec(1, 2_500), device);
         assert_eq!(wire, StreamFormat { sample_rate: 48_000, channels: 1 });
         assert_eq!(p.packet_frames(), 120);
 
@@ -149,6 +199,7 @@ mod tests {
             let n = rx.recv(&mut buf).unwrap();
             let Some(Packet::Audio { header, payload }) = decode(&buf[..n]) else { panic!() };
             assert_eq!((header.stream_id, header.timestamp, header.channels), (42, expect_ts, 1));
+            assert_eq!((header.slot, header.kind), (3, SourceKind::Mic));
             assert_eq!(payload.len(), 240);
             // Downmixed to mono: (0.5 - 0.25) / 2.
             let s = i16::from_le_bytes([payload[0], payload[1]]);
@@ -160,7 +211,7 @@ mod tests {
     fn packets_never_exceed_the_datagram_limit() {
         let tx = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
         let device = StreamFormat { sample_rate: 96_000, channels: 2 };
-        let (p, _, _) = Packetizer::new(tx, "127.0.0.1:9".parse().unwrap(), 1, device, 2, 20_000);
+        let (p, _, _) = Packetizer::new(tx, "127.0.0.1:9".parse().unwrap(), spec(2, 20_000), device);
         assert!(AUDIO_HEADER_LEN + p.packet_frames() * 4 <= MAX_DATAGRAM);
     }
 }

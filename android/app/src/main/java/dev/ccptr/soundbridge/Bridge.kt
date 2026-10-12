@@ -17,20 +17,24 @@ import java.util.concurrent.Executors
 
 const val DEFAULT_PORT = 47800
 
-enum class Send(val code: Int) {
-    Nothing(Native.SEND_NOTHING),
-    Microphone(Native.SEND_MIC),
-    PhoneAudio(Native.SEND_SYSTEM),
-}
-
 data class Settings(
-    val send: Send = Send.Nothing,
+    val sendMic: Boolean = false,
+    /** Send only speech from the microphone: no typing, clicks or breathing. */
+    val denoise: Boolean = false,
+    val sendPhoneAudio: Boolean = false,
     val play: Boolean = true,
     /** Fixed jitter buffer in ms, or [Native.BUFFER_AUTO]. */
     val bufferMs: Int = Native.BUFFER_AUTO,
     /** The last address typed into the connect box. */
     val host: String = "",
-)
+) {
+    /** What is sent, in the engine's order, which is the order of its stream slots. */
+    val sources: List<String>
+        get() = listOfNotNull("mic".takeIf { sendMic }, "system".takeIf { sendPhoneAudio })
+
+    val sendFlags: Int
+        get() = (if (sendMic) Native.SEND_MIC else 0) or (if (sendPhoneAudio) Native.SEND_SYSTEM else 0)
+}
 
 sealed interface Link {
     data object Idle : Link
@@ -40,9 +44,22 @@ sealed interface Link {
 
 data class Peer(val addr: String, val name: String, val busy: Boolean)
 
-data class TxStats(val rate: Int, val channels: Int, val level: Float)
+/** How a stream we send is faring at the other end. */
+data class RemoteStats(val playing: Boolean, val bufferMs: Float, val lost: Int, val underruns: Int)
+
+data class TxStats(
+    /** Index into [Settings.sources]. */
+    val slot: Int,
+    val rate: Int,
+    val channels: Int,
+    val level: Float,
+    val denoise: Boolean,
+    val remote: RemoteStats?,
+)
 
 data class RxStats(
+    /** "mic", "system" or "tone". */
+    val kind: String,
     val rate: Int,
     val channels: Int,
     val level: Float,
@@ -53,14 +70,11 @@ data class RxStats(
     val underruns: Int,
 )
 
-/** How the stream we send is faring at the other end. */
-data class RemoteStats(val playing: Boolean, val bufferMs: Float, val lost: Int, val underruns: Int)
-
 data class Stats(
     val rttMs: Float? = null,
-    val tx: TxStats? = null,
-    val rx: RxStats? = null,
-    val remote: RemoteStats? = null,
+    /** Streams being sent. A source missing here could not be opened. */
+    val tx: List<TxStats> = emptyList(),
+    val rx: List<RxStats> = emptyList(),
 )
 
 data class Notice(val text: String, val error: Boolean)
@@ -103,9 +117,10 @@ object Bridge : Native.Listener {
         val prefs = app.getSharedPreferences("settings", Context.MODE_PRIVATE)
         val saved = Settings(
             // Capturing phone audio needs fresh consent every time, so it
-            // cannot be restored; fall back to sending nothing.
-            send = Send.entries.getOrElse(prefs.getInt("send", 0)) { Send.Nothing }
-                .let { if (it == Send.PhoneAudio) Send.Nothing else it },
+            // is not restored. ("send" is how the choice was stored before
+            // there could be several.)
+            sendMic = prefs.getBoolean("sendMic", prefs.getInt("send", 0) == 1),
+            denoise = prefs.getBoolean("denoise", false),
             play = prefs.getBoolean("play", true),
             bufferMs = prefs.getInt("bufferMs", Native.BUFFER_AUTO),
             host = prefs.getString("host", "") ?: "",
@@ -124,16 +139,17 @@ object Bridge : Native.Listener {
         if (new == old) return
         _state.update { it.copy(settings = new) }
         app.getSharedPreferences("settings", Context.MODE_PRIVATE).edit {
-            putInt("send", new.send.ordinal)
+            putBoolean("sendMic", new.sendMic)
+            putBoolean("denoise", new.denoise)
             putBoolean("play", new.play)
             putInt("bufferMs", new.bufferMs)
             putString("host", new.host)
         }
-        if (old.send == Send.PhoneAudio && new.send != Send.PhoneAudio) {
+        if (old.sendPhoneAudio && !new.sendPhoneAudio) {
             BridgeService.stopProjection(app)
         }
         if (handle != 0L) {
-            Native.configure(handle, deviceName, new.send.code, new.play, new.bufferMs)
+            Native.configure(handle, deviceName, new.sendFlags, new.denoise, new.play, new.bufferMs)
         }
         reconcile()
     }
@@ -197,7 +213,7 @@ object Bridge : Native.Listener {
             acquire()
         }
         val s = _state.value.settings
-        handle = Native.start(deviceName, s.send.code, s.play, s.bufferMs, this)
+        handle = Native.start(deviceName, s.sendFlags, s.denoise, s.play, s.bufferMs, this)
         _state.update { it.copy(online = handle != 0L, peers = emptyList()) }
         if (handle == 0L) notice("Could not open a network socket", error = true)
     }
@@ -246,27 +262,39 @@ object Bridge : Native.Listener {
         }
     }
 
+    private fun <T> JSONObject.list(name: String, item: (JSONObject) -> T): List<T> {
+        val array = optJSONArray(name) ?: return emptyList()
+        return (0 until array.length()).map { item(array.getJSONObject(it)) }
+    }
+
     private fun parseStats(o: JSONObject) = Stats(
         rttMs = if (o.has("rtt")) o.optDouble("rtt").toFloat() else null,
-        tx = o.optJSONObject("tx")?.let {
-            TxStats(it.optInt("rate"), it.optInt("channels"), it.optDouble("level").toFloat())
+        tx = o.list("tx") {
+            TxStats(
+                slot = it.optInt("slot"),
+                rate = it.optInt("rate"),
+                channels = it.optInt("channels"),
+                level = it.optDouble("level").toFloat(),
+                denoise = it.optBoolean("denoise"),
+                remote = it.optJSONObject("remote")?.let { r ->
+                    RemoteStats(
+                        playing = r.optBoolean("playing"),
+                        bufferMs = r.optDouble("buffer").toFloat(),
+                        lost = r.optInt("lost"),
+                        underruns = r.optInt("underruns"),
+                    )
+                },
+            )
         },
-        rx = o.optJSONObject("rx")?.let {
+        rx = o.list("rx") {
             RxStats(
+                kind = it.optString("kind"),
                 rate = it.optInt("rate"),
                 channels = it.optInt("channels"),
                 level = it.optDouble("level").toFloat(),
                 playing = it.optBoolean("playing"),
                 bufferMs = it.optDouble("buffer").toFloat(),
                 jitterMs = it.optDouble("jitter").toFloat(),
-                lost = it.optInt("lost"),
-                underruns = it.optInt("underruns"),
-            )
-        },
-        remote = o.optJSONObject("remote")?.let {
-            RemoteStats(
-                playing = it.optBoolean("playing"),
-                bufferMs = it.optDouble("buffer").toFloat(),
                 lost = it.optInt("lost"),
                 underruns = it.optInt("underruns"),
             )

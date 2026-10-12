@@ -47,7 +47,7 @@ struct Stream {
     // Declared after the stream so they outlive it on drop.
     _host: cpal::Host,
     #[cfg(target_os = "linux")]
-    _virtual_mic: Option<virtual_mic::Loopback>,
+    _virtual_mic: Option<Arc<virtual_mic::Loopback>>,
 }
 
 impl StreamHandle for Stream {
@@ -305,7 +305,7 @@ impl AudioBackend for CpalBackend {
     ) -> Result<Box<dyn StreamHandle>, String> {
         #[cfg(target_os = "linux")]
         let (virtual_mic, host, device) = if request.kind == SinkKind::VirtualMic {
-            let loopback = virtual_mic::Loopback::spawn()?;
+            let loopback = virtual_mic::Loopback::shared()?;
             let (host, device) = loopback.wait_for_sink()?;
             (Some(loopback), host, Some(device))
         } else {
@@ -434,10 +434,14 @@ fn render<T>(
 /// `pw-loopback` creates a sink we play into and a source wired to it. The
 /// source is a real `Audio/Source` node, so it shows up as an input device
 /// everywhere, including in apps that hide monitor devices.
+///
+/// There is one for the whole process: every stream sent to the virtual
+/// microphone plays into the same sink, and PipeWire mixes them.
 #[cfg(target_os = "linux")]
 mod virtual_mic {
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
+    use std::sync::{Arc, Mutex, Weak};
     use std::time::{Duration, Instant};
 
     use cpal::traits::HostTrait;
@@ -446,8 +450,22 @@ mod virtual_mic {
 
     pub struct Loopback(Child);
 
+    /// The loopback in use, for as long as some stream holds it.
+    static SHARED: Mutex<Weak<Loopback>> = Mutex::new(Weak::new());
+
     impl Loopback {
-        pub fn spawn() -> Result<Loopback, String> {
+        /// The running loopback, started if no stream is using one.
+        pub fn shared() -> Result<Arc<Loopback>, String> {
+            let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(loopback) = shared.upgrade() {
+                return Ok(loopback);
+            }
+            let loopback = Arc::new(Loopback::spawn()?);
+            *shared = Arc::downgrade(&loopback);
+            Ok(loopback)
+        }
+
+        fn spawn() -> Result<Loopback, String> {
             let mut command = Command::new("pw-loopback");
             command
                 .args(["--name", "soundbridge-mic", "--latency", "5"])

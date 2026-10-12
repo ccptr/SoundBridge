@@ -24,3 +24,12 @@ strip = "debuginfo"
 opt-level = 3
 [profile.dev.package.rtrb]
 opt-level = 3
+# The noise filter and the FFT under it.
+[profile.dev.package.nnnoiseless]
+opt-level = 3
+[profile.dev.package.easyfft]
+opt-level = 3
+[profile.dev.package.realfft]
+opt-level = 3
+[profile.dev.package.rustfft]
+opt-level = 3

@@ -15,7 +15,7 @@ object Native {
         System.loadLibrary("soundbridge_android")
     }
 
-    const val SEND_NOTHING = 0
+    /** Bits of the `send` argument: any combination of sources. */
     const val SEND_MIC = 1
     const val SEND_SYSTEM = 2
 
@@ -27,16 +27,21 @@ object Native {
         fun onEvent(json: String)
     }
 
-    /** Returns a handle, or 0 if no network socket could be opened. */
+    /**
+     * Returns a handle, or 0 if no network socket could be opened. [denoise]
+     * sends only speech from the microphone.
+     */
     @JvmStatic
-    external fun start(name: String, send: Int, play: Boolean, bufferMs: Int, listener: Listener): Long
+    external fun start(
+        name: String, send: Int, denoise: Boolean, play: Boolean, bufferMs: Int, listener: Listener,
+    ): Long
 
     /** Hangs up, stops the engine and waits for its thread to finish. */
     @JvmStatic
     external fun stop(handle: Long)
 
     @JvmStatic
-    external fun configure(handle: Long, name: String, send: Int, play: Boolean, bufferMs: Int)
+    external fun configure(handle: Long, name: String, send: Int, denoise: Boolean, play: Boolean, bufferMs: Int)
 
     /** [host] should be an IP literal: a name would be resolved on the calling thread. */
     @JvmStatic

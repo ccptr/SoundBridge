@@ -42,7 +42,7 @@ class BridgeService : Service() {
         // The user ended capture from the system UI, or another app took over.
         override fun onStop() {
             endProjection()
-            Bridge.update { it.copy(send = Send.Nothing) }
+            Bridge.update { it.copy(sendPhoneAudio = false) }
         }
     }
 
@@ -102,7 +102,7 @@ class BridgeService : Service() {
         val micGranted =
             checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         var types = 0
-        if (linked && state.settings.send == Send.Microphone && micGranted) {
+        if (linked && state.settings.sendMic && micGranted) {
             types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
         }
         if (withProjection) types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
@@ -163,7 +163,7 @@ class BridgeService : Service() {
             projection = granted
             capture = SystemAudioCapture(granted)
             projecting = true
-            Bridge.update { it.copy(send = Send.PhoneAudio) }
+            Bridge.update { it.copy(sendPhoneAudio = true) }
         } catch (e: Exception) {
             endProjection()
             Bridge.notice("Could not capture phone audio: ${e.message}", error = true)

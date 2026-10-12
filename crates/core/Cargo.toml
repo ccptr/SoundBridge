@@ -14,6 +14,8 @@ cpal = ["dep:cpal"]
 rtrb = "0.4"
 socket2 = "0.6"
 if-addrs = "0.15"
+# The library only; its default features are a command-line tool.
+nnnoiseless = { version = "0.5", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

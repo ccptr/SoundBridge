@@ -21,6 +21,7 @@ use soundbridge_core::{
     SourceKind, State,
 };
 
+/// Bits of the `send` argument: any combination of sources.
 const SEND_MIC: jint = 1;
 const SEND_SYSTEM: jint = 2;
 
@@ -37,20 +38,22 @@ fn log_error(message: &str) {
     }
 }
 
-fn config(name: String, send: jint, play: bool, buffer_ms: jint) -> Config {
+fn config(name: String, send: jint, denoise: bool, play: bool, buffer_ms: jint) -> Config {
+    let mut sources = Vec::new();
+    if send & SEND_MIC != 0 {
+        sources.push(SourceConfig { denoise, ..SourceConfig::new(SourceKind::Mic) });
+    }
+    if send & SEND_SYSTEM != 0 {
+        sources.push(SourceConfig::new(SourceKind::System));
+    }
     Config {
         name,
         port: DEFAULT_PORT,
         port_fallback: true,
         listen: true,
         discover: true,
-        send: match send {
-            SEND_MIC => Some(SourceKind::Mic),
-            SEND_SYSTEM => Some(SourceKind::System),
-            _ => None,
-        }
-        .map(|kind| SourceConfig { kind, device: None, channels: None }),
-        play: play.then_some(SinkConfig { kind: SinkKind::Speaker, device: None }),
+        send: sources,
+        play: play.then(|| SinkConfig::new(SinkKind::Speaker)).into_iter().collect(),
         buffer: match buffer_ms {
             ms if ms >= 0 => BufferMode::Fixed { ms: ms as f32 },
             _ => BufferMode::default(),
@@ -83,6 +86,14 @@ fn num(v: f32) -> f32 {
     if v.is_finite() { v } else { 0.0 }
 }
 
+fn kind_name(kind: SourceKind) -> &'static str {
+    match kind {
+        SourceKind::Mic => "mic",
+        SourceKind::System => "system",
+        SourceKind::Tone => "tone",
+    }
+}
+
 fn event_json(event: &Event) -> String {
     let mut o = String::with_capacity(256);
     match event {
@@ -113,19 +124,42 @@ fn event_json(event: &Event) -> String {
             if let Some(rtt) = stats.rtt_ms {
                 let _ = write!(o, r#","rtt":{}"#, num(rtt));
             }
-            if let Some(tx) = &stats.tx {
+            o.push_str(r#","tx":["#);
+            for (i, tx) in stats.tx.iter().enumerate() {
+                if i > 0 {
+                    o.push(',');
+                }
                 let _ = write!(
                     o,
-                    r#","tx":{{"rate":{},"channels":{},"level":{}}}"#,
+                    r#"{{"slot":{},"kind":"{}","rate":{},"channels":{},"level":{},"denoise":{}"#,
+                    tx.slot,
+                    kind_name(tx.kind),
                     tx.format.sample_rate,
                     tx.format.channels,
-                    num(tx.level)
+                    num(tx.level),
+                    tx.denoise
                 );
+                if let Some(remote) = &tx.remote {
+                    let _ = write!(
+                        o,
+                        r#","remote":{{"playing":{},"buffer":{},"lost":{},"underruns":{}}}"#,
+                        remote.playing,
+                        remote.buffer_us as f32 / 1000.0,
+                        remote.lost,
+                        remote.underruns
+                    );
+                }
+                o.push('}');
             }
-            if let Some(rx) = &stats.rx {
+            o.push_str(r#"],"rx":["#);
+            for (i, rx) in stats.rx.iter().enumerate() {
+                if i > 0 {
+                    o.push(',');
+                }
                 let _ = write!(
                     o,
-                    r#","rx":{{"rate":{},"channels":{},"level":{},"playing":{},"buffer":{},"jitter":{},"lost":{},"underruns":{}}}"#,
+                    r#"{{"kind":"{}","rate":{},"channels":{},"level":{},"playing":{},"buffer":{},"jitter":{},"lost":{},"underruns":{}}}"#,
+                    kind_name(rx.kind),
                     rx.format.sample_rate,
                     rx.format.channels,
                     num(rx.level),
@@ -136,16 +170,7 @@ fn event_json(event: &Event) -> String {
                     rx.underruns
                 );
             }
-            if let Some(remote) = &stats.remote {
-                let _ = write!(
-                    o,
-                    r#","remote":{{"playing":{},"buffer":{},"lost":{},"underruns":{}}}"#,
-                    remote.playing,
-                    remote.buffer_us as f32 / 1000.0,
-                    remote.lost,
-                    remote.underruns
-                );
-            }
+            o.push(']');
             o.push('}');
         }
         Event::Info(text) | Event::Error(text) => {
@@ -165,6 +190,7 @@ pub extern "system" fn Java_dev_ccptr_soundbridge_Native_start<'l>(
     _class: JClass<'l>,
     name: JString<'l>,
     send: jint,
+    denoise: jboolean,
     play: jboolean,
     buffer_ms: jint,
     listener: JObject<'l>,
@@ -189,7 +215,8 @@ pub extern "system" fn Java_dev_ccptr_soundbridge_Native_start<'l>(
             let _ = env.exception_clear();
         }
     };
-    match Engine::start(config(name, send, play != 0, buffer_ms), Arc::new(aaudio::AAudioBackend), on_event) {
+    let config = config(name, send, denoise != 0, play != 0, buffer_ms);
+    match Engine::start(config, Arc::new(aaudio::AAudioBackend), on_event) {
         Ok(engine) => Box::into_raw(Box::new(engine)) as jlong,
         Err(e) => {
             log_error(&format!("could not start the engine: {e}"));
@@ -223,12 +250,13 @@ pub extern "system" fn Java_dev_ccptr_soundbridge_Native_configure<'l>(
     handle: jlong,
     name: JString<'l>,
     send: jint,
+    denoise: jboolean,
     play: jboolean,
     buffer_ms: jint,
 ) {
     let name = string(&mut env, &name);
     if let Some(engine) = engine(handle) {
-        engine.configure(config(name, send, play != 0, buffer_ms));
+        engine.configure(config(name, send, denoise != 0, play != 0, buffer_ms));
     }
 }
 

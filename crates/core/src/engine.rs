@@ -4,10 +4,14 @@
 //! [`Event`]s.
 //!
 //! A link is symmetric. Each end decides for itself what it captures and
-//! sends ([`Config::send`]) and whether it plays what arrives
+//! sends ([`Config::send`]) and where what arrives is played
 //! ([`Config::play`]); nothing a peer says can make this end start
 //! recording. "Phone mic to PC" is the phone sending its mic and the PC
 //! playing; "PC audio to phone" is the reverse; both at once is both.
+//!
+//! Either list can be any length. Every source is its own stream, numbered
+//! by its place in the list (its slot), and every arriving stream is played
+//! on each sink that takes its kind.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -26,9 +30,11 @@ use crate::audio::{
 };
 pub use crate::playout::BufferMode;
 use crate::playout::{self, PlayoutWriter};
-use crate::protocol::{self, AudioHeader, BYE_BUSY, BYE_NORMAL, CAP_PLAYS, CAP_SENDS, Packet, Report};
-use crate::sender::{Packetizer, TxShared};
-use crate::synthetic;
+use crate::protocol::{
+    self, AudioHeader, BYE_BUSY, BYE_NORMAL, CAP_PLAYS, CAP_SENDS, MAX_STREAMS, Packet, Report,
+};
+use crate::sender::{Packetizer, StreamSpec, TxShared};
+use crate::{denoise, synthetic};
 
 const HELLO_INTERVAL: Duration = Duration::from_millis(250);
 const PING_INTERVAL: Duration = Duration::from_millis(500);
@@ -39,6 +45,9 @@ const PEER_TTL: Duration = Duration::from_secs(7);
 /// Pings arrive twice a second, so this much silence means the peer is gone.
 const SESSION_TIMEOUT: Duration = Duration::from_secs(3);
 const RETRY_DEVICE_AFTER: Duration = Duration::from_secs(2);
+/// An incoming stream this quiet has been stopped by its sender, and its
+/// output is closed.
+const STREAM_IDLE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SourceConfig {
@@ -47,12 +56,29 @@ pub struct SourceConfig {
     pub device: Option<String>,
     /// Channels to send. `None` picks mono for a mic, stereo for system audio.
     pub channels: Option<u16>,
+    /// Send speech only: keys, clicks, breathing and background noise are
+    /// removed (see [`crate::denoise`]). Makes the stream mono.
+    pub denoise: bool,
+}
+
+impl SourceConfig {
+    pub fn new(kind: SourceKind) -> Self {
+        SourceConfig { kind, device: None, channels: None, denoise: false }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SinkConfig {
     pub kind: SinkKind,
     pub device: Option<String>,
+    /// The kind of stream played here; `None` plays every stream.
+    pub from: Option<SourceKind>,
+}
+
+impl SinkConfig {
+    pub fn new(kind: SinkKind) -> Self {
+        SinkConfig { kind, device: None, from: None }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -68,8 +94,12 @@ pub struct Config {
     pub listen: bool,
     /// Probe the local network for listening peers while idle.
     pub discover: bool,
-    pub send: Option<SourceConfig>,
-    pub play: Option<SinkConfig>,
+    /// What to capture and send, one stream each. At most
+    /// [`MAX_STREAMS`](protocol::MAX_STREAMS) are used.
+    pub send: Vec<SourceConfig>,
+    /// Where received streams go. A stream is played on every sink that
+    /// takes its kind, and dropped if none does.
+    pub play: Vec<SinkConfig>,
     /// Audio per packet. Smaller is lower latency and more packets.
     pub packet_ms: f32,
     pub buffer: BufferMode,
@@ -86,8 +116,8 @@ impl Default for Config {
             port_fallback: false,
             listen: true,
             discover: false,
-            send: None,
-            play: Some(SinkConfig { kind: SinkKind::Speaker, device: None }),
+            send: Vec::new(),
+            play: vec![SinkConfig::new(SinkKind::Speaker)],
             packet_ms: 2.5,
             buffer: BufferMode::default(),
             period_frames: 128,
@@ -113,15 +143,27 @@ pub struct Peer {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TxStats {
+    /// Index of the source in [`Config::send`].
+    pub slot: u8,
+    pub kind: SourceKind,
     pub format: StreamFormat,
     pub packet_ms: f32,
     pub packets: u64,
-    /// Peak input level since the previous report, 0..=1.
+    /// Peak level sent since the previous report, 0..=1.
     pub level: f32,
+    /// Noise suppression is running on this stream.
+    pub denoise: bool,
+    /// The peer's view of this stream, if it is playing it.
+    pub remote: Option<Report>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RxStats {
+    /// The peer's slot for this stream.
+    pub slot: u8,
+    pub kind: SourceKind,
+    /// Where it is being played.
+    pub sink: SinkKind,
     pub format: StreamFormat,
     pub device_format: StreamFormat,
     pub playing: bool,
@@ -139,13 +181,14 @@ pub struct RxStats {
     pub level: f32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Stats {
     pub rtt_ms: Option<f32>,
-    pub tx: Option<TxStats>,
-    pub rx: Option<RxStats>,
-    /// The peer's view of the stream we are sending it.
-    pub remote: Option<Report>,
+    /// The streams being sent. A configured source that is missing here
+    /// could not be opened.
+    pub tx: Vec<TxStats>,
+    /// The streams being played, once per sink each goes to.
+    pub rx: Vec<RxStats>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -271,9 +314,28 @@ fn raise_thread_priority() {
 
 struct Tx {
     stream: Box<dyn StreamHandle>,
+    kind: SourceKind,
     shared: Arc<TxShared>,
     format: StreamFormat,
     packet_ms: f32,
+    denoise: bool,
+}
+
+/// One configured source; its index in `Session::tx` is its slot.
+#[derive(Default)]
+struct TxSlot {
+    open: Option<Tx>,
+    /// When to (re)try opening the device; `None` while it is open.
+    retry_at: Option<Instant>,
+    /// The last device error shown, so a retry loop reports it only once.
+    last_error: Option<String>,
+}
+
+impl TxSlot {
+    /// A source `tend_streams` should open as soon as it runs.
+    fn pending(now: Instant) -> Self {
+        TxSlot { retry_at: Some(now), ..TxSlot::default() }
+    }
 }
 
 struct Rx {
@@ -285,6 +347,19 @@ struct Rx {
     shared: Arc<playout::Shared>,
 }
 
+/// One incoming stream on one of the sinks it goes to.
+struct RxSlot {
+    slot: u8,
+    /// Index into `Config::play`.
+    sink: usize,
+    kind: SourceKind,
+    open: Option<Rx>,
+    /// Don't hammer a device that just failed to open.
+    retry_at: Option<Instant>,
+    last_error: Option<String>,
+    last_packet: Instant,
+}
+
 struct Session {
     peer: SocketAddr,
     name: String,
@@ -293,16 +368,11 @@ struct Session {
     last_heard: Instant,
     last_ping: Instant,
     last_stats: Instant,
-    tx: Option<Tx>,
-    rx: Option<Rx>,
-    /// Don't hammer a device that just failed to open.
-    rx_retry_at: Option<Instant>,
-    /// When to try the capture device again after it failed or died.
-    tx_retry_at: Option<Instant>,
-    /// The last device error shown, so a retry loop reports it only once.
-    last_error: Option<String>,
+    tx: Vec<TxSlot>,
+    rx: Vec<RxSlot>,
     rtt_us: Option<f32>,
-    remote: Option<Report>,
+    /// The peer's latest reports on the streams we send it.
+    remote: Vec<Report>,
 }
 
 enum Phase {
@@ -361,8 +431,8 @@ impl Worker {
     }
 
     fn caps(&self) -> u8 {
-        (if self.config.send.is_some() { CAP_SENDS } else { 0 })
-            | (if self.config.play.is_some() { CAP_PLAYS } else { 0 })
+        (if self.config.send.is_empty() { 0 } else { CAP_SENDS })
+            | (if self.config.play.is_empty() { 0 } else { CAP_PLAYS })
     }
 
     fn command(&mut self, cmd: Command) {
@@ -380,8 +450,7 @@ impl Worker {
             }
             Command::Configure(new) => {
                 let old = std::mem::replace(&mut self.config, *new);
-                let tx_changed = old.send != self.config.send
-                    || old.packet_ms != self.config.packet_ms
+                let all_tx_changed = old.packet_ms != self.config.packet_ms
                     || old.period_frames != self.config.period_frames
                     || old.sample_rate != self.config.sample_rate;
                 let rx_changed = old.play != self.config.play
@@ -389,16 +458,17 @@ impl Worker {
                     || old.period_frames != self.config.period_frames;
                 if let Phase::Connected(session) = &mut self.phase {
                     if rx_changed {
-                        // Reopened by the next audio packet.
-                        session.rx = None;
-                        session.rx_retry_at = None;
-                        session.last_error = None;
+                        // Reopened by the next audio packets.
+                        session.rx.clear();
                     }
-                    if tx_changed {
-                        // Closed now; `tend_streams` opens the new source.
-                        session.tx = None;
-                        session.tx_retry_at = Some(Instant::now());
-                        session.last_error = None;
+                    // Sources that are the same as before keep running.
+                    let now = Instant::now();
+                    session.tx.resize_with(self.config.send.len().min(MAX_STREAMS), TxSlot::default);
+                    for (slot, tx) in session.tx.iter_mut().enumerate() {
+                        if all_tx_changed || old.send.get(slot) != self.config.send.get(slot) {
+                            // Closed now; `tend_streams` opens the new source.
+                            *tx = TxSlot::pending(now);
+                        }
                     }
                 }
             }
@@ -459,50 +529,70 @@ impl Worker {
                 }
                 if now - session.last_ping >= PING_INTERVAL {
                     session.last_ping = now;
-                    let report = session.rx.as_ref().map(|rx| {
+                    // A stream on several sinks is reported as the first of them.
+                    let mut reports: Vec<Report> = Vec::new();
+                    for slot in &session.rx {
+                        let Some(rx) = &slot.open else { continue };
+                        if reports.iter().any(|r| r.slot == slot.slot) {
+                            continue;
+                        }
                         let w = rx.writer.stats();
-                        Report {
+                        reports.push(Report {
+                            slot: slot.slot,
                             playing: rx.shared.playing(),
                             buffer_us: rx.shared.buffer_us(),
                             jitter_us: w.jitter_us,
                             lost: w.lost,
                             underruns: rx.shared.underruns(),
-                        }
-                    });
+                        });
+                    }
                     let peer = session.peer;
                     let t_us = (now - self.epoch).as_micros() as u64;
-                    send(&self.socket, Packet::Ping { t_us, report }, peer);
+                    send(&self.socket, Packet::Ping { t_us, reports }, peer);
                 } else if now - session.last_stats >= STATS_INTERVAL {
                     session.last_stats = now;
                     self.tend_streams(now);
                     let Phase::Connected(session) = &mut self.phase else { return };
+                    let play = &self.config.play;
                     let stats = Stats {
                         rtt_ms: session.rtt_us.map(|us| us / 1000.0),
-                        tx: session.tx.as_ref().map(|tx| TxStats {
-                            format: tx.format,
-                            packet_ms: tx.packet_ms,
-                            packets: tx.shared.packets(),
-                            level: tx.shared.take_peak(),
-                        }),
-                        rx: session.rx.as_ref().map(|rx| {
-                            let w = rx.writer.stats();
-                            RxStats {
-                                format: rx.format,
-                                device_format: rx.device_format,
-                                playing: rx.shared.playing(),
-                                buffer_ms: rx.shared.buffer_us() as f32 / 1000.0,
-                                target_ms: w.target_us as f32 / 1000.0,
-                                jitter_ms: w.jitter_us as f32 / 1000.0,
-                                packets: w.packets,
-                                lost: w.lost,
-                                late: w.late,
-                                underruns: rx.shared.underruns(),
-                                skips: rx.shared.skips(),
-                                drift_ppm: rx.shared.drift_ppm(),
-                                level: rx.shared.take_peak(),
-                            }
-                        }),
-                        remote: session.remote,
+                        tx: (session.tx.iter().enumerate())
+                            .filter_map(|(slot, tx)| Some((slot as u8, tx.open.as_ref()?)))
+                            .map(|(slot, tx)| TxStats {
+                                slot,
+                                kind: tx.kind,
+                                format: tx.format,
+                                packet_ms: tx.packet_ms,
+                                packets: tx.shared.packets(),
+                                level: tx.shared.take_peak(),
+                                denoise: tx.denoise,
+                                remote: session.remote.iter().find(|r| r.slot == slot).copied(),
+                            })
+                            .collect(),
+                        rx: (session.rx.iter())
+                            .filter_map(|slot| Some((slot, slot.open.as_ref()?, play.get(slot.sink)?)))
+                            .map(|(slot, rx, sink)| {
+                                let w = rx.writer.stats();
+                                RxStats {
+                                    slot: slot.slot,
+                                    kind: slot.kind,
+                                    sink: sink.kind,
+                                    format: rx.format,
+                                    device_format: rx.device_format,
+                                    playing: rx.shared.playing(),
+                                    buffer_ms: rx.shared.buffer_us() as f32 / 1000.0,
+                                    target_ms: w.target_us as f32 / 1000.0,
+                                    jitter_ms: w.jitter_us as f32 / 1000.0,
+                                    packets: w.packets,
+                                    lost: w.lost,
+                                    late: w.late,
+                                    underruns: rx.shared.underruns(),
+                                    skips: rx.shared.skips(),
+                                    drift_ppm: rx.shared.drift_ppm(),
+                                    level: rx.shared.take_peak(),
+                                }
+                            })
+                            .collect(),
                     };
                     self.emit(Event::Stats(stats));
                 }
@@ -598,10 +688,10 @@ impl Worker {
                 self.emit(Event::Info(message));
                 self.emit(Event::State(State::Idle));
             }
-            Packet::Ping { t_us, report } => {
+            Packet::Ping { t_us, reports } => {
                 if let Some(session) = self.session_from(from) {
                     session.last_heard = now;
-                    session.remote = report;
+                    session.remote = reports;
                     send(&self.socket, Packet::Pong { t_us }, from);
                 }
             }
@@ -629,14 +719,7 @@ impl Worker {
 
     fn establish(&mut self, peer: SocketAddr, name: String, initiator: bool, now: Instant) {
         let name = if name.is_empty() { peer.ip().to_string() } else { name };
-        let (tx, last_error) = match self.open_capture(peer) {
-            Ok(tx) => (tx, None),
-            Err(e) => {
-                self.emit(Event::Error(e.clone()));
-                (None, Some(e))
-            }
-        };
-        let retry_at = last_error.as_ref().map(|_| now + RETRY_DEVICE_AFTER);
+        let sources = self.config.send.len().min(MAX_STREAMS);
         self.phase = Phase::Connected(Box::new(Session {
             peer,
             name: name.clone(),
@@ -644,42 +727,48 @@ impl Worker {
             last_heard: now,
             last_ping: now,
             last_stats: now,
-            tx,
-            rx: None,
-            rx_retry_at: None,
-            tx_retry_at: retry_at,
-            last_error,
+            tx: (0..sources).map(|_| TxSlot::pending(now)).collect(),
+            rx: Vec::new(),
             rtt_us: None,
-            remote: None,
+            remote: Vec::new(),
         }));
         self.emit(Event::State(State::Connected { addr: peer, name }));
+        self.tend_streams(now);
     }
 
-    /// Opens the configured source, if there is one, and starts sending.
-    fn open_capture(&self, peer: SocketAddr) -> Result<Option<Tx>, String> {
-        let Some(source) = self.config.send.clone() else { return Ok(None) };
+    /// Opens the source configured for `slot` and starts sending.
+    fn open_capture(&self, peer: SocketAddr, slot: usize) -> Result<Tx, String> {
+        let source = self.config.send[slot].clone();
         let channels = source.channels.unwrap_or(match source.kind {
             SourceKind::System => 2,
             SourceKind::Mic | SourceKind::Tone => 1,
         });
-        let packet_us = (self.config.packet_ms.clamp(0.5, 20.0) * 1000.0) as u32;
-        let (socket, stream_id) = (self.socket.clone(), random_u32());
+        let spec = StreamSpec {
+            slot: slot as u8,
+            kind: source.kind,
+            stream_id: random_u32(),
+            channels,
+            packet_us: (self.config.packet_ms.clamp(0.5, 20.0) * 1000.0) as u32,
+            denoise: source.denoise,
+        };
+        let socket = self.socket.clone();
         // The packetizer can only be built once the backend knows the device
         // format; this carries its stats handle back out of the callback.
         let (info_tx, info_rx) = mpsc::channel();
         let make: MakeCapture = Box::new(move |device| {
-            let (mut packetizer, shared, wire) =
-                Packetizer::new(socket, peer, stream_id, device, channels, packet_us);
+            let (mut packetizer, shared, wire) = Packetizer::new(socket, peer, spec, device);
             let packet_ms = packetizer.packet_frames() as f32 * 1000.0 / wire.sample_rate as f32;
-            let _ = info_tx.send((shared, wire, packet_ms));
+            let _ = info_tx.send((shared, wire, packet_ms, packetizer.filtered()));
             Box::new(move |samples| packetizer.push(samples))
         });
         let request = CaptureRequest {
             kind: source.kind,
             device: source.device,
-            sample_rate: self.config.sample_rate,
+            // The noise filter cannot work at any other rate.
+            sample_rate: if source.denoise { denoise::RATE } else { self.config.sample_rate },
             channels,
             period_frames: self.config.period_frames,
+            denoise: source.denoise,
         };
         let opened = match source.kind {
             SourceKind::Tone => {
@@ -694,97 +783,129 @@ impl Worker {
             SourceKind::Tone => "test tone",
         };
         let stream = opened.map_err(|e| format!("Could not capture {what}: {e}"))?;
-        let (shared, format, packet_ms) =
+        let (shared, format, packet_ms, denoise) =
             info_rx.try_recv().map_err(|_| format!("Could not capture {what}: the stream never started"))?;
-        Ok(Some(Tx { stream, shared, format, packet_ms }))
-    }
-
-    /// Shows a device error unless it is the one already on screen.
-    fn report(&mut self, error: String) {
-        if let Phase::Connected(session) = &mut self.phase {
-            if session.last_error.as_ref() == Some(&error) {
-                return;
-            }
-            session.last_error = Some(error.clone());
+        if source.denoise && !denoise {
+            self.emit(Event::Info(format!(
+                "Noise suppression needs a {} kHz {what}; this one runs at {}, so it is sent as it is",
+                denoise::RATE / 1000,
+                format
+            )));
         }
-        self.emit(Event::Error(error));
+        Ok(Tx { stream, kind: source.kind, shared, format, packet_ms, denoise })
     }
 
-    /// Replaces streams whose device went away, and retries a source that
-    /// could not be opened.
+    /// Opens sources that are due, replaces streams whose device went away,
+    /// and closes outputs whose stream has stopped arriving.
     fn tend_streams(&mut self, now: Instant) {
         let Phase::Connected(session) = &mut self.phase else { return };
-        if session.rx.as_ref().is_some_and(|rx| !rx.stream.is_alive()) {
-            // The next audio packet reopens the output.
-            session.rx = None;
-        }
-        if session.tx.as_ref().is_some_and(|tx| !tx.stream.is_alive()) {
-            session.tx = None;
-            session.tx_retry_at = Some(now);
-        }
-        if session.tx.is_some() || session.tx_retry_at.is_none_or(|at| now < at) {
-            return;
+        session.rx.retain(|rx| now.saturating_duration_since(rx.last_packet) < STREAM_IDLE);
+        for rx in &mut session.rx {
+            if rx.open.as_ref().is_some_and(|rx| !rx.stream.is_alive()) {
+                // The next audio packet reopens the output.
+                rx.open = None;
+            }
         }
         let peer = session.peer;
-        let opened = self.open_capture(peer);
-        let Phase::Connected(session) = &mut self.phase else { return };
-        match opened {
-            Ok(tx) => {
-                session.tx = tx;
-                session.tx_retry_at = None;
+        for slot in 0..session.tx.len() {
+            let Phase::Connected(session) = &mut self.phase else { return };
+            let tx = &mut session.tx[slot];
+            if tx.open.as_ref().is_some_and(|tx| !tx.stream.is_alive()) {
+                tx.open = None;
+                tx.retry_at = Some(now);
             }
-            Err(e) => {
-                session.tx_retry_at = Some(now + RETRY_DEVICE_AFTER);
-                self.report(e);
+            if tx.open.is_some() || tx.retry_at.is_none_or(|at| now < at) {
+                continue;
+            }
+            let opened = self.open_capture(peer, slot);
+            let Phase::Connected(session) = &mut self.phase else { return };
+            let tx = &mut session.tx[slot];
+            match opened {
+                Ok(open) => *tx = TxSlot { open: Some(open), ..TxSlot::default() },
+                Err(e) => {
+                    tx.retry_at = Some(now + RETRY_DEVICE_AFTER);
+                    // Shown unless it is the one already on screen.
+                    if tx.last_error.as_ref() != Some(&e) {
+                        tx.last_error = Some(e.clone());
+                        (self.on_event)(Event::Error(e));
+                    }
+                }
             }
         }
     }
 
     fn audio(&mut self, header: AudioHeader, payload: &[u8], from: SocketAddr, now: Instant) {
-        let Some(sink) = self.config.play.clone() else { return };
         let now_us = (now - self.epoch).as_micros() as i64;
         let format = StreamFormat { sample_rate: header.sample_rate, channels: header.channels as u16 };
         let Phase::Connected(session) = &mut self.phase else { return };
+        let session = &mut **session;
         if session.peer != from {
             return;
         }
         session.last_heard = now;
-        match &mut session.rx {
-            Some(rx) if rx.format == format => {
-                if rx.stream_id != header.stream_id {
-                    // The sender restarted capture: same device, new timeline.
-                    rx.stream_id = header.stream_id;
-                    rx.writer.restart();
-                }
+        // The sender put a different kind of source in this slot: route it afresh.
+        session.rx.retain(|rx| rx.slot != header.slot || rx.kind == header.kind);
+        for (sink, config) in self.config.play.iter().enumerate() {
+            if config.from.is_some_and(|kind| kind != header.kind) {
+                continue;
             }
-            _ => {
-                if session.rx_retry_at.is_some_and(|at| now < at) {
-                    return;
+            let found = session.rx.iter().position(|rx| rx.slot == header.slot && rx.sink == sink);
+            let at = found.unwrap_or_else(|| {
+                session.rx.push(RxSlot {
+                    slot: header.slot,
+                    sink,
+                    kind: header.kind,
+                    open: None,
+                    retry_at: None,
+                    last_error: None,
+                    last_packet: now,
+                });
+                session.rx.len() - 1
+            });
+            let rx = &mut session.rx[at];
+            rx.last_packet = now;
+            match &mut rx.open {
+                Some(open) if open.format == format => {
+                    if open.stream_id != header.stream_id {
+                        // The sender restarted capture: same device, new timeline.
+                        open.stream_id = header.stream_id;
+                        open.writer.restart();
+                    }
                 }
-                // Close the old output before opening its replacement.
-                session.rx = None;
-                let opened = open_playback(&*self.backend, &self.config, &sink, format, header.stream_id);
-                let Phase::Connected(session) = &mut self.phase else { return };
-                // Opening a device can take long enough to look like silence
-                // from the peer, whose packets were queueing all the while.
-                session.last_heard = Instant::now();
-                match opened {
-                    Ok(rx) => session.rx = Some(rx),
-                    Err(e) => {
-                        session.rx_retry_at = Some(now + RETRY_DEVICE_AFTER);
-                        self.report(format!("Could not open audio output: {e}"));
-                        return;
+                _ => {
+                    if rx.retry_at.is_some_and(|at| now < at) {
+                        continue;
+                    }
+                    // Close the old output before opening its replacement.
+                    rx.open = None;
+                    let opened = open_playback(&*self.backend, &self.config, config, format, header.stream_id);
+                    // Opening a device can take long enough to look like silence
+                    // from the peer, whose packets were queueing all the while.
+                    session.last_heard = Instant::now();
+                    match opened {
+                        Ok(open) => {
+                            rx.open = Some(open);
+                            rx.retry_at = None;
+                            rx.last_error = None;
+                        }
+                        Err(e) => {
+                            rx.retry_at = Some(now + RETRY_DEVICE_AFTER);
+                            let e = format!("Could not open audio output: {e}");
+                            if rx.last_error.as_ref() != Some(&e) {
+                                rx.last_error = Some(e.clone());
+                                (self.on_event)(Event::Error(e));
+                            }
+                            continue;
+                        }
                     }
                 }
             }
-        }
-        let Phase::Connected(session) = &mut self.phase else { return };
-        if let Some(rx) = &mut session.rx {
-            rx.writer.push(header.timestamp, payload, now_us);
+            if let Some(open) = &mut rx.open {
+                open.writer.push(header.timestamp, payload, now_us);
+            }
         }
     }
 }
-
 fn open_playback(
     backend: &dyn AudioBackend,
     config: &Config,

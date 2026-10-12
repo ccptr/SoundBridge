@@ -7,17 +7,18 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use soundbridge_core::cpal_backend::CpalBackend;
 use soundbridge_core::{
     AudioBackend, BufferMode, Config, DEFAULT_PORT, DeviceDirection, Engine, Event, SinkConfig,
-    SinkKind, SourceConfig, SourceKind, State, Stats,
+    SinkKind, SourceConfig, SourceKind, State, Stats, StreamFormat,
 };
 
 /// A low-latency audio bridge between machines on the same network.
 ///
 /// One end runs `listen`, the other `connect`s to it; each end chooses for
 /// itself what it sends (--send) and where received audio goes (--play).
+/// Both can be given several times, for several streams at once.
 #[derive(Parser)]
 #[command(name = "soundbridge", version, after_help = EXAMPLES)]
 struct Cli {
@@ -30,12 +31,18 @@ Examples:
   Use a phone as this PC's microphone (the phone connects and sends its mic):
     soundbridge listen --play virtual-mic
 
+  The same, while also hearing what the phone is playing:
+    soundbridge listen --play mic:virtual-mic --play system:speaker
+
   Hear this PC on the phone (the phone is listening):
     soundbridge connect 192.168.1.20 --send system --play none
 
   Talk both ways between two PCs:
     soundbridge listen --send mic
-    soundbridge connect otherpc.local --send mic";
+    soundbridge connect otherpc.local --send mic
+
+  Send a headset mic, voice only, and what this PC is playing:
+    soundbridge connect 192.168.1.20 --send mic=ID --send system --denoise";
 
 #[derive(Subcommand)]
 enum Command {
@@ -67,47 +74,86 @@ enum Command {
     Devices,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum Send {
-    /// A microphone or other input device
-    Mic,
-    /// Whatever this machine is playing
-    System,
-    /// A generated 440 Hz test tone
-    Tone,
+/// One `--send`: a kind of source, and optionally which device.
+#[derive(Clone)]
+struct Source {
+    kind: SourceKind,
+    device: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, ValueEnum)]
-enum Play {
-    /// An output device
-    Speaker,
-    /// A virtual microphone other applications can record from (PipeWire)
-    VirtualMic,
-    /// Receive and measure, but play nothing
-    Null,
-    /// Ignore incoming audio
-    None,
+/// One `--play`: where streams go, and optionally which kind and on which
+/// device. No sink is `none`.
+#[derive(Clone)]
+struct Sink {
+    from: Option<SourceKind>,
+    kind: Option<SinkKind>,
+    device: Option<String>,
+}
+
+fn parse_kind(s: &str) -> Result<SourceKind, String> {
+    match s {
+        "mic" => Ok(SourceKind::Mic),
+        "system" => Ok(SourceKind::System),
+        "tone" => Ok(SourceKind::Tone),
+        _ => Err(format!("'{s}' is not a kind of source: expected mic, system or tone")),
+    }
+}
+
+/// Splits a trailing `=DEVICE` off an argument. Device ids may themselves
+/// contain `=`, so the first one is the separator.
+fn split_device(s: &str) -> (&str, Option<String>) {
+    match s.split_once('=') {
+        Some((what, device)) => (what, Some(device.to_string()).filter(|d| !d.is_empty())),
+        None => (s, None),
+    }
+}
+
+fn parse_source(s: &str) -> Result<Source, String> {
+    let (kind, device) = split_device(s);
+    Ok(Source { kind: parse_kind(kind)?, device })
+}
+
+fn parse_sink(s: &str) -> Result<Sink, String> {
+    let (what, device) = split_device(s);
+    let (from, sink) = match what.split_once(':') {
+        Some((from, sink)) => (Some(parse_kind(from)?), sink),
+        None => (None, what),
+    };
+    let kind = match sink {
+        "speaker" => Some(SinkKind::Speaker),
+        "virtual-mic" => Some(SinkKind::VirtualMic),
+        "null" => Some(SinkKind::Null),
+        "none" => None,
+        _ => return Err(format!("'{sink}' is not a sink: expected speaker, virtual-mic, null or none")),
+    };
+    Ok(Sink { from, kind, device })
 }
 
 #[derive(Args)]
 struct LinkArgs {
-    /// Capture and send audio from this machine
-    #[arg(short, long, value_enum)]
-    send: Option<Send>,
-    /// Device to capture from, by id (see `soundbridge devices`). For
-    /// `--send system` this is the output device whose playback is captured
-    #[arg(long, value_name = "ID")]
-    input_device: Option<String>,
+    /// Capture and send audio from this machine: `mic` (a microphone or
+    /// other input), `system` (whatever this machine is playing) or `tone`
+    /// (a 440 Hz test tone). Add `=ID` to pick the device (see `soundbridge
+    /// devices`); for `system` that is the output whose playback is
+    /// captured. Repeat to send several streams
+    #[arg(short, long, value_name = "SOURCE[=ID]", value_parser = parse_source)]
+    send: Vec<Source>,
     /// Channels to send [default: 1 for mic, 2 for system]
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..=2))]
     channels: Option<u16>,
+    /// Send only speech from microphones: typing, mouse clicks, breathing
+    /// and background noise are removed. Adds about 50 ms of delay
+    #[arg(long)]
+    denoise: bool,
 
-    /// What to do with audio received from the peer
-    #[arg(short, long, value_enum, default_value = "speaker")]
-    play: Play,
-    /// Device to play on, by id
-    #[arg(long, value_name = "ID")]
-    output_device: Option<String>,
+    /// What to do with audio received from the peer: `speaker` (an output
+    /// device), `virtual-mic` (a microphone other applications can record
+    /// from; PipeWire), `null` (receive and measure, play nothing) or `none`
+    /// (ignore it). Add `=ID` to pick the device. Prefix `mic:` or `system:`
+    /// to play only that kind of stream there, and repeat to send each kind
+    /// somewhere else
+    #[arg(short, long, value_name = "[KIND:]SINK[=ID]", default_value = "speaker", value_parser = parse_sink)]
+    play: Vec<Sink>,
 
     /// Jitter buffer: `auto` adapts to the network, or a fixed size in ms
     #[arg(short, long, default_value = "auto", value_parser = parse_buffer)]
@@ -160,22 +206,19 @@ impl LinkArgs {
             port_fallback: false,
             listen,
             discover: false,
-            send: self.send.map(|kind| SourceConfig {
-                kind: match kind {
-                    Send::Mic => SourceKind::Mic,
-                    Send::System => SourceKind::System,
-                    Send::Tone => SourceKind::Tone,
-                },
-                device: self.input_device.clone(),
-                channels: self.channels,
-            }),
-            play: match self.play {
-                Play::Speaker => Some(SinkKind::Speaker),
-                Play::VirtualMic => Some(SinkKind::VirtualMic),
-                Play::Null => Some(SinkKind::Null),
-                Play::None => None,
-            }
-            .map(|kind| SinkConfig { kind, device: self.output_device.clone() }),
+            send: (self.send.iter())
+                .map(|source| SourceConfig {
+                    kind: source.kind,
+                    device: source.device.clone(),
+                    channels: self.channels,
+                    denoise: self.denoise && source.kind == SourceKind::Mic,
+                })
+                .collect(),
+            play: (self.play.iter())
+                .filter_map(|sink| {
+                    Some(SinkConfig { kind: sink.kind?, device: sink.device.clone(), from: sink.from })
+                })
+                .collect(),
             packet_ms: self.packet,
             buffer: match self.buffer {
                 Buffer::Auto => BufferMode::Auto { min_ms: self.min_buffer, max_ms: self.max_buffer },
@@ -228,11 +271,8 @@ fn devices() {
     let devices = backend.devices();
     println!("Audio system: {}", backend.host_name());
     for (direction, title) in [
-        (DeviceDirection::Input, "Inputs (--send mic --input-device ID)"),
-        (
-            DeviceDirection::Output,
-            "Outputs (--output-device ID, or --send system --input-device ID)",
-        ),
+        (DeviceDirection::Input, "Inputs (--send mic=ID)"),
+        (DeviceDirection::Output, "Outputs (--play speaker=ID, or --send system=ID)"),
     ] {
         println!("\n{title}:");
         let mut any = false;
@@ -252,8 +292,8 @@ fn discover(timeout: f32) -> Result<(), String> {
         port: 0,
         listen: false,
         discover: true,
-        send: None,
-        play: None,
+        send: Vec::new(),
+        play: Vec::new(),
         ..Config::default()
     };
     let _engine = Engine::start(config, Arc::new(CpalBackend::new()), move |e| {
@@ -373,10 +413,13 @@ impl Status {
             }
             self.last_logged = Some(Instant::now());
         }
+        // One stream each way gets the full story; more have to share the line.
+        let brief = stats.tx.len() > 1 || stats.rx.len() > 1;
         let mut parts = Vec::new();
-        if let Some(tx) = &stats.tx {
-            let mut part = format!("send {} {}", tx.format, meter(tx.level));
-            if let Some(remote) = &stats.remote {
+        for tx in &stats.tx {
+            let filtered = if tx.denoise { " voice only" } else { "" };
+            let mut part = format!("send {}{filtered} {}", stream(tx.kind, tx.format, brief), meter(tx.level));
+            if let Some(remote) = tx.remote.filter(|_| !brief) {
                 part += &format!(" > peer buffer {:.1} ms", remote.buffer_us as f32 / 1000.0);
                 if remote.lost > 0 || remote.underruns > 0 {
                     part += &format!(" (lost {}, underruns {})", remote.lost, remote.underruns);
@@ -384,19 +427,23 @@ impl Status {
             }
             parts.push(part);
         }
-        if let Some(rx) = &stats.rx {
+        for rx in &stats.rx {
             let state = if rx.playing { "" } else { " (buffering)" };
-            parts.push(format!(
-                "recv {} {} buffer {:.1} ms{state} jitter {:.1} lost {} late {} underruns {} {:+} ppm",
-                rx.format,
+            let mut part = format!(
+                "recv {} {} buffer {:.1} ms{state}",
+                stream(rx.kind, rx.format, brief),
                 meter(rx.level),
-                rx.buffer_ms,
-                rx.jitter_ms,
-                rx.lost,
-                rx.late,
-                rx.underruns,
-                rx.drift_ppm,
-            ));
+                rx.buffer_ms
+            );
+            if !brief {
+                part += &format!(
+                    " jitter {:.1} lost {} late {} underruns {} {:+} ppm",
+                    rx.jitter_ms, rx.lost, rx.late, rx.underruns, rx.drift_ppm,
+                );
+            } else if rx.lost > 0 || rx.underruns > 0 {
+                part += &format!(" (lost {}, underruns {})", rx.lost, rx.underruns);
+            }
+            parts.push(part);
         }
         if let Some(rtt) = stats.rtt_ms {
             parts.push(format!("rtt {rtt:.1} ms"));
@@ -412,6 +459,16 @@ impl Status {
         let _ = std::io::stderr().flush();
         self.drawn = true;
     }
+}
+
+/// Names a stream by what it carries: at length, or just its kind.
+fn stream(kind: SourceKind, format: StreamFormat, brief: bool) -> String {
+    let kind = match kind {
+        SourceKind::Mic => "mic",
+        SourceKind::System => "system",
+        SourceKind::Tone => "tone",
+    };
+    if brief { kind.to_string() } else { format!("{kind} {format}") }
 }
 
 /// A five-step level meter covering roughly the top 40 dB.
@@ -445,6 +502,47 @@ mod tests {
         assert!(matches!(parse_buffer("2.5ms"), Ok(Buffer::Fixed(ms)) if ms == 2.5));
         assert!(parse_buffer("fast").is_err());
         assert!(parse_buffer("-1").is_err());
+    }
+
+    #[test]
+    fn sources_and_sinks() {
+        let source = parse_source("mic=pipewire:alsa_input.usb={a=b}").unwrap();
+        assert_eq!((source.kind, source.device.as_deref()), (SourceKind::Mic, Some("pipewire:alsa_input.usb={a=b}")));
+        assert!(parse_source("system").unwrap().device.is_none());
+        assert!(parse_source("loud").is_err());
+
+        let sink = parse_sink("mic:virtual-mic").unwrap();
+        assert_eq!((sink.from, sink.kind), (Some(SourceKind::Mic), Some(SinkKind::VirtualMic)));
+        let sink = parse_sink("speaker=wasapi:{0.0}").unwrap();
+        assert_eq!((sink.from, sink.kind, sink.device.as_deref()), (None, Some(SinkKind::Speaker), Some("wasapi:{0.0}")));
+        assert!(parse_sink("none").unwrap().kind.is_none());
+        assert!(parse_sink("mic:loud").is_err());
+        assert!(parse_sink("loud:speaker").is_err());
+    }
+
+    #[test]
+    fn several_streams_each_way() {
+        let cli = Cli::try_parse_from([
+            "soundbridge", "listen", "--denoise", "--send", "mic", "--send", "system", "--play", "mic:virtual-mic",
+            "--play", "system:speaker", "--play", "none",
+        ])
+        .unwrap();
+        let Command::Listen { link, .. } = cli.command else { panic!() };
+        let config = link.config(0, true);
+        let sent: Vec<_> = config.send.iter().map(|s| (s.kind, s.denoise)).collect();
+        assert_eq!(sent, [(SourceKind::Mic, true), (SourceKind::System, false)]);
+        let played: Vec<_> = config.play.iter().map(|s| (s.from, s.kind)).collect();
+        assert_eq!(
+            played,
+            [(Some(SourceKind::Mic), SinkKind::VirtualMic), (Some(SourceKind::System), SinkKind::Speaker)]
+        );
+
+        // With nothing said, received audio goes to the speakers.
+        let cli = Cli::try_parse_from(["soundbridge", "connect", "host"]).unwrap();
+        let Command::Connect { link, .. } = cli.command else { panic!() };
+        let config = link.config(0, false);
+        assert!(config.send.is_empty());
+        assert_eq!(config.play, [SinkConfig::new(SinkKind::Speaker)]);
     }
 
     #[test]

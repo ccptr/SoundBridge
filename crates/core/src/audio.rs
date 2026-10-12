@@ -51,6 +51,10 @@ pub struct CaptureRequest {
     pub channels: u16,
     /// Preferred callback size in frames. Backends treat it as a hint.
     pub period_frames: u32,
+    /// The stream will go through noise suppression, which only works at
+    /// [`crate::denoise::RATE`]: get exactly `sample_rate` if at all possible,
+    /// even where that costs the device's fastest path.
+    pub denoise: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

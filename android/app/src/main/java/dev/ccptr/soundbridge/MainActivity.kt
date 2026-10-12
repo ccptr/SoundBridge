@@ -132,27 +132,35 @@ private fun Screen() {
         askProjection.launch(manager.createScreenCaptureIntent())
     }
 
-    // Both sources record audio; which one was being chosen survives the
-    // permission dialog (and a rotation during it).
-    var pendingSend by rememberSaveable { mutableStateOf(Send.Nothing) }
+    // Both sources record audio; which one was being switched on survives
+    // the permission dialog (and a rotation during it).
+    var pendingPhoneAudio by rememberSaveable { mutableStateOf(false) }
     val askMicrophone = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
         when {
             !granted -> Bridge.notice("Without the microphone permission there is nothing to send", error = true)
-            pendingSend == Send.PhoneAudio -> startProjection()
-            else -> Bridge.update { it.copy(send = pendingSend) }
+            pendingPhoneAudio -> startProjection()
+            else -> Bridge.update { it.copy(sendMic = true) }
         }
     }
-    val chooseSend = { send: Send ->
+    val setMicrophone = { on: Boolean ->
+        if (on && !context.granted(Manifest.permission.RECORD_AUDIO)) {
+            pendingPhoneAudio = false
+            askMicrophone.launch(Manifest.permission.RECORD_AUDIO)
+        } else {
+            Bridge.update { it.copy(sendMic = on) }
+        }
+    }
+    val setPhoneAudio = { on: Boolean ->
         when {
-            send == Send.Nothing -> Bridge.update { it.copy(send = send) }
+            !on -> Bridge.update { it.copy(sendPhoneAudio = false) }
             !context.granted(Manifest.permission.RECORD_AUDIO) -> {
-                pendingSend = send
+                pendingPhoneAudio = true
                 askMicrophone.launch(Manifest.permission.RECORD_AUDIO)
             }
-            send == Send.PhoneAudio -> startProjection()
-            else -> Bridge.update { it.copy(send = send) }
+            // Switches on once consent is given and capture has started.
+            else -> startProjection()
         }
     }
 
@@ -176,31 +184,29 @@ private fun Screen() {
             if (state.link == Link.Idle) PeersCard(state) else SessionCard(state)
 
             Section("Send from this phone") {
-                Choices(
-                    options = listOf(
-                        Send.Nothing to "Nothing",
-                        Send.Microphone to "Microphone",
-                        Send.PhoneAudio to "Phone audio",
-                    ),
-                    selected = state.settings.send,
-                    onSelect = chooseSend,
-                )
-                if (state.settings.send == Send.PhoneAudio) {
+                Toggle("Microphone", state.settings.sendMic, setMicrophone)
+                if (state.settings.sendMic) {
+                    Toggle("Voice only", state.settings.denoise) { on -> Bridge.update { it.copy(denoise = on) } }
+                    Hint(
+                        if (state.settings.denoise) {
+                            "Typing, mouse clicks, breathing and background noise are removed. " +
+                                "Adds about 50 ms of delay."
+                        } else {
+                            "Removes everything but speech: for a phone on the desk next to a keyboard."
+                        },
+                    )
+                }
+                Toggle("Phone audio", state.settings.sendPhoneAudio, setPhoneAudio)
+                if (state.settings.sendPhoneAudio) {
                     Hint("Sends what apps are playing. Calls, and apps that forbid capture, stay silent.")
                 }
             }
 
             Section("Play what the other device sends") {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        if (state.settings.play) "On this phone's speaker or headphones" else "Off",
-                        modifier = Modifier.weight(1f),
-                    )
-                    Switch(
-                        checked = state.settings.play,
-                        onCheckedChange = { on -> Bridge.update { it.copy(play = on) } },
-                    )
-                }
+                Toggle(
+                    if (state.settings.play) "On this phone's speaker or headphones" else "Off",
+                    state.settings.play,
+                ) { on -> Bridge.update { it.copy(play = on) } }
             }
 
             Section("Jitter buffer") {
@@ -255,6 +261,14 @@ private fun Section(title: String, content: @Composable ColumnScope.() -> Unit) 
 @Composable
 private fun Hint(text: String) {
     Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+}
+
+@Composable
+private fun Toggle(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(label, modifier = Modifier.weight(1f))
+        Switch(checked = checked, onCheckedChange = onChange)
+    }
 }
 
 @Composable
@@ -322,12 +336,20 @@ private fun SessionCard(state: UiState) {
                     (stats.rttMs?.let { " · network round trip ${"%.1f".format(it)} ms" } ?: ""),
             )
 
-            val tx = stats.tx
-            when {
-                tx != null -> {
-                    Text("Sending · ${formatOf(tx.rate, tx.channels)}")
+            val sources = state.settings.sources
+            if (sources.isEmpty()) Hint("Not sending anything.")
+            sources.forEachIndexed { slot, kind ->
+                val name = kindName(kind)
+                val tx = stats.tx.firstOrNull { it.slot == slot }
+                if (tx == null) {
+                    Hint("Not sending the $name: it could not be opened.")
+                } else {
+                    Text(
+                        "Sending $name · ${formatOf(tx.rate, tx.channels)}" +
+                            if (tx.denoise) " · voice only" else "",
+                    )
                     Meter(tx.level)
-                    val remote = stats.remote
+                    val remote = tx.remote
                     Hint(
                         when {
                             remote == null -> "The other end is not playing it"
@@ -337,29 +359,33 @@ private fun SessionCard(state: UiState) {
                         },
                     )
                 }
-                state.settings.send == Send.Nothing -> Hint("Not sending anything.")
-                else -> Hint("Not sending: the source could not be opened.")
             }
 
-            val rx = stats.rx
             when {
-                rx != null -> {
-                    Text("Receiving · ${formatOf(rx.rate, rx.channels)}")
-                    Meter(rx.level)
-                    Hint(
-                        if (!rx.playing) "Buffering…"
-                        else "Buffer ${"%.1f".format(rx.bufferMs)} ms · jitter ${"%.1f".format(rx.jitterMs)} ms" +
-                            problems(rx.lost, rx.underruns),
-                    )
-                }
+                stats.rx.isNotEmpty() -> {}
                 !state.settings.play -> Hint("Ignoring incoming audio.")
                 else -> Hint("The other device is not sending anything.")
+            }
+            for (rx in stats.rx) {
+                Text("Receiving ${kindName(rx.kind)} · ${formatOf(rx.rate, rx.channels)}")
+                Meter(rx.level)
+                Hint(
+                    if (!rx.playing) "Buffering…"
+                    else "Buffer ${"%.1f".format(rx.bufferMs)} ms · jitter ${"%.1f".format(rx.jitterMs)} ms" +
+                        problems(rx.lost, rx.underruns),
+                )
             }
         }
         OutlinedButton(onClick = { Bridge.disconnect() }) {
             Text(if (link is Link.Connected) "Disconnect" else "Cancel")
         }
     }
+}
+
+private fun kindName(kind: String) = when (kind) {
+    "mic" -> "microphone"
+    "system" -> "device audio"
+    else -> "test tone"
 }
 
 private fun formatOf(rate: Int, channels: Int) =

@@ -3,7 +3,8 @@
 //! The fast path is only granted to streams that take the device's own
 //! sample rate and a float or 16-bit format with no effects, so nothing here
 //! requests a rate: the engine is told what the device chose and resamples
-//! on the receiving side.
+//! on the receiving side. The one exception is a microphone that is to be
+//! noise-filtered, which has to run at the filter's rate.
 
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -105,7 +106,13 @@ impl AudioBackend for AAudioBackend {
         }
         let dead = Arc::new(AtomicBool::new(false));
         let (slot, mut claim) = slot::<CaptureFn>();
-        let stream = builder(AudioDirection::Input, request.channels, &dead)?
+        let mut builder = builder(AudioDirection::Input, request.channels, &dead)?;
+        if request.denoise {
+            // May cost the fast path on a device that runs at another rate;
+            // the filter's own delay is several times what that adds.
+            builder = builder.sample_rate(request.sample_rate as i32);
+        }
+        let stream = builder
             // The preset with the least processing in the way, and the one
             // devices are required to keep on a low-latency path.
             .input_preset(AudioInputPreset::VoiceRecognition)

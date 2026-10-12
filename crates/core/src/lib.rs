@@ -2,8 +2,8 @@
 //!
 //! One side captures (a microphone, or whatever the machine is playing),
 //! packs raw PCM into small UDP datagrams and sends them; the other feeds
-//! them through an adaptive jitter buffer into an output device. Both
-//! directions can run at once over the same socket.
+//! them through an adaptive jitter buffer into an output device. Any number
+//! of streams can run at once in each direction over the same socket.
 //!
 //! The latency budget is spent in three places, and the code is organised
 //! around keeping each small:
@@ -16,6 +16,7 @@
 //!   than a fixed guess, and held there by resampling ([`playout`]).
 
 pub mod audio;
+pub mod denoise;
 #[cfg(all(feature = "cpal", not(target_os = "android")))]
 pub mod cpal_backend;
 pub mod engine;
