@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=SoundBridge
+GenericName=Audio Link
+Comment=Low-latency audio link between a phone and a PC
+Exec=soundbridge-desktop
+Icon=soundbridge
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=audio;microphone;phone;stream;
+StartupWMClass=soundbridge
