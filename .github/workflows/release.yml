@@ -137,35 +137,30 @@ jobs:
           7z a "$dir.zip" "$dir"
           gh release upload "$TAG" --clobber "$dir.zip"
 
-  # Packages the binaries the linux job attached, instead of building them again.
   pacman:
-    needs: linux
-    # Runs when the linux job was skipped (only: pacman), on what the release
-    # already has.
-    if: ${{ !failure() && !cancelled() && (!inputs.only || inputs.only == 'pacman') }}
+    if: ${{ !inputs.only || inputs.only == 'pacman' }}
     name: Arch Linux package
     runs-on: ubuntu-24.04
     container: archlinux:base-devel
     steps:
       - name: Install tools
-        run: pacman -Syu --noconfirm git github-cli
+        run: pacman -Syu --noconfirm git github-cli rust
 
       # The PKGBUILD of the commit the workflow runs from, which for a run by
-      # hand need not be the tag.
+      # hand need not be the tag; the sources it builds are the tag's.
       - uses: actions/checkout@v5
 
-      # makepkg refuses to run as root. The archive is already next to the
-      # PKGBUILD, so it is not downloaded again; its checksum in the PKGBUILD
-      # is that of an earlier build.
+      # makepkg refuses to run as root, and installs what the build needs
+      # through sudo.
       - name: Build
-        working-directory: packaging/aur/soundbridge-bin
+        working-directory: packaging/aur/soundbridge
         run: |
-          gh release download "$TAG" --pattern "soundbridge-$TAG-linux-x86_64.tar.gz"
           useradd -m build
+          echo 'build ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/build
           chown -R build .
           sed -i "s/^pkgver=.*/pkgver=${TAG#v}/" PKGBUILD
-          su build -c 'makepkg --nodeps --skipchecksums'
+          su build -c 'makepkg --syncdeps --noconfirm'
 
       - name: Attach to the release
-        working-directory: packaging/aur/soundbridge-bin
-        run: gh release upload "$TAG" --clobber soundbridge-bin-"${TAG#v}"-*.pkg.tar.zst
+        working-directory: packaging/aur/soundbridge
+        run: gh release upload "$TAG" --clobber soundbridge-"${TAG#v}"-*.pkg.tar.zst

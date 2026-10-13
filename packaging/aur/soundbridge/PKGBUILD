@@ -1,0 +1,59 @@
+# Maintainer: ccptr <cccptr@protonmail.com>
+
+pkgname=soundbridge
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Low-latency audio link between a phone and a PC: command-line tool and desktop app"
+arch=('x86_64' 'aarch64')
+url="https://github.com/ccptr/SoundBridge"
+license=('GPL-2.0-or-later')
+depends=(
+  'alsa-lib'
+  'gcc-libs'
+  'glibc'
+  'libpipewire'
+  'libxcb'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'vulkan-driver'
+  'vulkan-icd-loader'
+  'wayland'
+)
+makedepends=('cargo' 'clang' 'git')
+optdepends=('pipewire-audio: pw-loopback, for the virtual microphone')
+# The C code in the dependency tree is linked by rustc, which cannot read the
+# GCC LTO objects makepkg would otherwise have it built as.
+options=('!lto')
+source=("$pkgname::git+$url.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc --print host-tuple)"
+}
+
+build() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # Not the desktop app: its tests would build gpui a second time, since
+  # tests cannot share the panic=abort objects of the release build.
+  cargo test --frozen --release -p soundbridge-core -p soundbridge-cli
+}
+
+package() {
+  cd "$pkgname"
+  install -Dm755 -t "$pkgdir/usr/bin" \
+    target/release/soundbridge target/release/soundbridge-desktop
+  install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname" README.md
+  install -Dm644 -t "$pkgdir/usr/share/applications" crates/desktop/assets/soundbridge.desktop
+  install -Dm644 -t "$pkgdir/usr/share/icons/hicolor/scalable/apps" crates/desktop/assets/soundbridge.svg
+}
