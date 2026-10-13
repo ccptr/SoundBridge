@@ -101,7 +101,9 @@ last two can be tuned from there:
 | Hold | `--gate-hold MS`, 10 to 2000 | 250 | bridges longer gaps in speech, and lets more noise trail a phrase |
 | Threshold | `--gate-threshold LEVEL`, 0.05 to 0.95 | 0.5 | shuts out more that is not speech, and more quiet speech with it |
 
-The apps offer a few steps of each; the command line takes any value.
+The Android app offers a few steps of each. The desktop app has a slider for
+each, as it has for the gain and a fixed jitter buffer; a right click on a
+slider turns it into a field that takes any value. So does the command line.
 
 ### Microphone level
 

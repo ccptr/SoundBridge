@@ -13,11 +13,14 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
 use gpui::{
-    App, Application, Bounds, ClickEvent, Context, Div, ElementId, Entity, SharedString, Stateful,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, div, prelude::*, px, relative, rgb, size,
+    App, Application, Bounds, ClickEvent, Context, CursorStyle, DispatchPhase, Div, ElementId, Entity,
+    Focusable, HitboxBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, SharedString,
+    Stateful, Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div,
+    prelude::*, px, relative, rgb, size,
 };
 use soundbridge_core::cpal_backend::CpalBackend;
 use soundbridge_core::denoise::{Gate, Mode};
+use soundbridge_core::gain::OFFSET_RANGE_DB;
 use soundbridge_core::{
     AudioBackend, BufferMode, Config, DEFAULT_PORT, DeviceDirection, DeviceInfo, Engine, Event,
     Peer, SinkConfig, SinkKind, SourceConfig, SourceKind, SourceSettings, State, Stats, Streams,
@@ -25,7 +28,7 @@ use soundbridge_core::{
 use soundbridge_core::protocol::MAX_STREAMS;
 
 use settings::{Kind, Play, Route, Settings, Source, StreamRoute};
-use text_input::{Submitted, TextInput};
+use text_input::{Cancelled, Submitted, TextInput};
 
 /// What a microphone can be filtered down to. A tuning that is none of
 /// these leaves all of them unlit.
@@ -35,15 +38,13 @@ const DENOISE_CHOICES: [(Mode, &str); 4] = [
     (Mode::VOICE, "Voice only"),
     (Mode::WHOLE_WORDS, "Whole words"),
 ];
-const LOOKAHEAD_CHOICES: [(u32, &str); 5] =
-    [(20, "20 ms"), (40, "40 ms"), (80, "80 ms"), (120, "120 ms"), (200, "200 ms")];
-const HOLD_CHOICES: [(u32, &str); 4] = [(100, "0.1 s"), (250, "0.25 s"), (500, "0.5 s"), (1000, "1 s")];
-const THRESHOLD_CHOICES: [(f32, &str); 3] = [(0.7, "Strict"), (0.5, "Normal"), (0.3, "Lenient")];
-/// Jitter-buffer choices offered in the UI; `None` is automatic.
-const GAIN_CHOICES: [(i32, &str); 6] =
-    [(-12, "-12 dB"), (-6, "-6 dB"), (0, "0 dB"), (6, "+6 dB"), (12, "+12 dB"), (24, "+24 dB")];
-const BUFFER_CHOICES: [(Option<u32>, &str); 5] =
-    [(None, "Auto"), (Some(5), "5 ms"), (Some(10), "10 ms"), (Some(20), "20 ms"), (Some(40), "40 ms")];
+const BUFFER_CHOICES: [(bool, &str); 2] = [(false, "Automatic"), (true, "Fixed")];
+/// The fixed jitter buffer to start from, in ms.
+const BUFFER_MS: u32 = 20;
+/// The fixed jitter buffers that can be typed in, in ms.
+const BUFFER_RANGE_MS: std::ops::RangeInclusive<u32> = 1..=500;
+/// How far a slider's thumb reaches past each end of its track.
+const THUMB_REACH: f32 = 7.;
 #[cfg(feature = "self-update")]
 const UPDATE_CHOICES: [(bool, &str); 2] = [(true, "Automatic"), (false, "Off")];
 
@@ -70,6 +71,68 @@ struct Tuning {
     denoise: Mode,
     auto_gain: bool,
     gain_db: i32,
+}
+
+/// A number set with a slider, or typed in exactly where the slider is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Exact {
+    Gain(Mic),
+    Lookahead(Mic),
+    Hold(Mic),
+    Threshold(Mic),
+    Buffer,
+}
+
+impl Exact {
+    /// What follows the number where it is shown.
+    fn unit(self) -> &'static str {
+        match self {
+            Exact::Gain(_) => " dB",
+            Exact::Lookahead(_) | Exact::Hold(_) | Exact::Buffer => " ms",
+            Exact::Threshold(_) => "",
+        }
+    }
+
+    /// How the number is shown beside its slider.
+    fn label(self, value: f32) -> String {
+        match self {
+            Exact::Gain(_) if value != 0.0 => format!("{value:+} dB"),
+            _ => format!("{value}{}", self.unit()),
+        }
+    }
+
+    /// What the slider covers, and in what steps. Less usual values are typed.
+    fn slider(self) -> (std::ops::RangeInclusive<f32>, f32) {
+        match self {
+            Exact::Gain(_) => (-24.0..=24.0, 1.0),
+            Exact::Lookahead(_) => (0.0..=Gate::MAX_LOOKAHEAD_MS as f32, 10.0),
+            Exact::Hold(_) => (50.0..=1000.0, 50.0),
+            Exact::Threshold(_) => (0.1..=0.9, 0.05),
+            Exact::Buffer => (1.0..=100.0, 1.0),
+        }
+    }
+
+    /// What may be typed.
+    fn hint(self) -> String {
+        match self {
+            Exact::Gain(_) => format!("In dB, from {} to {}.", OFFSET_RANGE_DB.start(), OFFSET_RANGE_DB.end()),
+            Exact::Lookahead(_) => format!("In ms, up to {}, in steps of 10.", Gate::MAX_LOOKAHEAD_MS),
+            Exact::Hold(_) => format!("In ms, from 10 to {}.", Gate::MAX_HOLD_MS),
+            Exact::Threshold(_) => {
+                format!("From {} to {}; lower is more lenient.", Gate::THRESHOLDS.start(), Gate::THRESHOLDS.end())
+            }
+            Exact::Buffer => format!("In ms, from {} to {}.", BUFFER_RANGE_MS.start(), BUFFER_RANGE_MS.end()),
+        }
+    }
+}
+
+/// The field one of those is being typed into.
+struct ExactInput {
+    what: Exact,
+    input: Entity<TextInput>,
+    /// Set once what was typed turned out not to be a number.
+    invalid: bool,
+    _subscriptions: [Subscription; 2],
 }
 
 /// How far a look for a new release, asked for by hand, has got.
@@ -102,6 +165,10 @@ struct Bridge {
     notice: Option<Notice>,
     devices: Vec<DeviceInfo>,
     open_picker: Option<Picker>,
+    /// The number being typed in, if any.
+    exact: Option<ExactInput>,
+    /// The slider being dragged and where it is, which is set on letting go.
+    drag: Option<(Exact, f32)>,
     host: Entity<TextInput>,
     /// False for a copy that something else keeps current.
     #[cfg(feature = "self-update")]
@@ -181,6 +248,8 @@ impl Bridge {
             notice,
             devices: Vec::new(),
             open_picker: None,
+            exact: None,
+            drag: None,
             host,
             #[cfg(feature = "self-update")]
             self_updating: soundbridge_update::available(),
@@ -203,6 +272,14 @@ impl Bridge {
                 }
                 if matches!(state, State::Connecting { .. }) {
                     self.notice = None;
+                }
+                // The other device's settings go with the connection.
+                let remote = |exact: &ExactInput| {
+                    use Exact::*;
+                    matches!(exact.what, Gain(Mic::Remote(_)) | Lookahead(Mic::Remote(_)) | Hold(Mic::Remote(_)) | Threshold(Mic::Remote(_)))
+                };
+                if !matches!(state, State::Connected { .. }) && self.exact.as_ref().is_some_and(remote) {
+                    self.exact = None;
                 }
                 self.state = state;
             }
@@ -281,6 +358,115 @@ impl Bridge {
                     engine.set_remote(*source);
                 }
                 cx.notify();
+            }
+        }
+    }
+
+    /// How a microphone is filtered and levelled now.
+    fn tuning(&self, mic: Mic) -> Option<Tuning> {
+        match mic {
+            Mic::Local(index) => self.settings.sources.get(index).map(|source| Tuning {
+                denoise: source.denoise,
+                auto_gain: source.auto_gain,
+                gain_db: source.gain_db,
+            }),
+            Mic::Remote(slot) => self.stats.remote_sources.iter().find(|s| s.slot == slot).map(remote_tuning),
+        }
+    }
+
+    /// What one of the numbers is now, if it is set to anything.
+    fn exact_value(&self, what: Exact) -> Option<f32> {
+        let gate = |mic| match self.tuning(mic)?.denoise {
+            Mode::Gate(gate) => Some(gate),
+            _ => None,
+        };
+        match what {
+            Exact::Gain(mic) => Some(self.tuning(mic)?.gain_db as f32),
+            Exact::Lookahead(mic) => Some(gate(mic)?.lookahead_ms as f32),
+            Exact::Hold(mic) => Some(gate(mic)?.hold_ms as f32),
+            Exact::Threshold(mic) => Some(gate(mic)?.threshold),
+            Exact::Buffer => self.settings.buffer_ms.map(|ms| ms as f32),
+        }
+    }
+
+    /// Puts a field where a number's choices are, holding what it is now.
+    fn open_exact(&mut self, what: Exact, window: &mut Window, cx: &mut Context<Self>) {
+        let value = self.exact_value(what).map(|value| value.to_string()).unwrap_or_default();
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new(cx, "");
+            input.set_content(value, cx);
+            input.select_all_content(cx);
+            input
+        });
+        window.focus(&input.focus_handle(cx));
+        let _subscriptions = [
+            cx.subscribe(&input, |this, _, _: &Submitted, cx| this.apply_exact(cx)),
+            cx.subscribe(&input, |this, _, _: &Cancelled, cx| this.close_exact(cx)),
+        ];
+        self.open_picker = None;
+        self.exact = Some(ExactInput { what, input, invalid: false, _subscriptions });
+        cx.notify();
+    }
+
+    fn close_exact(&mut self, cx: &mut Context<Self>) {
+        self.exact = None;
+        cx.notify();
+    }
+
+    /// Sets the number to what was typed.
+    fn apply_exact(&mut self, cx: &mut Context<Self>) {
+        let Some(exact) = &mut self.exact else { return };
+        let Some(value) = parse_number(&exact.input.read(cx).content()) else {
+            exact.invalid = true;
+            cx.notify();
+            return;
+        };
+        let what = exact.what;
+        self.exact = None;
+        self.set_number(what, value, cx);
+    }
+
+    /// Moves the slider being dragged to a place along its track, from 0 to 1.
+    fn drag(&mut self, what: Exact, along: f32, cx: &mut Context<Self>) {
+        let (range, step) = what.slider();
+        let value = range.start() + along.clamp(0.0, 1.0) * (range.end() - range.start());
+        // Whole steps, without what adding them up leaves behind.
+        let value = ((value / step).round() * step * 100.0).round() / 100.0;
+        self.drag = Some((what, value));
+        cx.notify();
+    }
+
+    fn end_drag(&mut self, cx: &mut Context<Self>) {
+        if let Some((what, value)) = self.drag.take()
+            && self.exact_value(what) != Some(value)
+        {
+            self.set_number(what, value, cx);
+        }
+        cx.notify();
+    }
+
+    /// Sets a number, brought into what it can be.
+    fn set_number(&mut self, what: Exact, value: f32, cx: &mut Context<Self>) {
+        let gate = |set: fn(&mut Gate, f32)| {
+            move |tuning: &mut Tuning| {
+                if let Mode::Gate(gate) = &mut tuning.denoise {
+                    set(gate, value);
+                }
+                tuning.denoise = tuning.denoise.clamped();
+            }
+        };
+        match what {
+            Exact::Gain(mic) => {
+                let db = value.clamp(*OFFSET_RANGE_DB.start(), *OFFSET_RANGE_DB.end()).round() as i32;
+                self.tune(mic, |tuning| tuning.gain_db = db, cx);
+            }
+            Exact::Lookahead(mic) => self.tune(mic, gate(|gate, ms| gate.lookahead_ms = ms.round() as u32), cx),
+            Exact::Hold(mic) => self.tune(mic, gate(|gate, ms| gate.hold_ms = ms.round() as u32), cx),
+            Exact::Threshold(mic) => self.tune(mic, gate(|gate, level| gate.threshold = level), cx),
+            Exact::Buffer => {
+                let ms = value.round() as u32;
+                self.settings.buffer_ms = Some(ms.clamp(*BUFFER_RANGE_MS.start(), *BUFFER_RANGE_MS.end()));
+                self.settings_changed(cx);
             }
         }
     }
@@ -478,6 +664,12 @@ fn kind_name(kind: SourceKind) -> &'static str {
     }
 }
 
+/// A number as it gets typed: with a decimal comma, or with its unit after it.
+fn parse_number(text: &str) -> Option<f32> {
+    let number = text.trim().trim_end_matches(|c: char| c.is_alphabetic() || c.is_whitespace());
+    number.replace(',', ".").replace('\u{2212}', "-").parse().ok().filter(|number: &f32| number.is_finite())
+}
+
 fn resolve(peer: &str) -> Result<SocketAddr, String> {
     let with_port = if peer.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) {
         peer.to_string()
@@ -574,6 +766,124 @@ fn detail(text: impl Into<SharedString>) -> Div {
 }
 
 impl Bridge {
+    /// A slider for a number, which a right click turns into a field for
+    /// typing any value, one the slider does not reach included.
+    fn number_row(&self, id: impl Into<ElementId>, what: Exact, cx: &mut Context<Self>) -> Div {
+        if let Some(exact) = self.exact.as_ref().filter(|exact| exact.what == what) {
+            let hint = format!("{} Enter sets it, Escape leaves it as it was.", what.hint());
+            return div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(exact.input.clone())
+                        .child(
+                            button("exact-set", "Set", true)
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.apply_exact(cx))),
+                        )
+                        .child(
+                            button("exact-cancel", "Cancel", false)
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_exact(cx))),
+                        ),
+                )
+                .child(match exact.invalid {
+                    true => detail(format!("That is not a number. {hint}")).text_color(rgb(theme::BAD)),
+                    false => detail(hint),
+                });
+        }
+        let dragged = self.drag.filter(|&(dragged, _)| dragged == what).map(|(_, value)| value);
+        let Some(value) = dragged.or_else(|| self.exact_value(what)) else { return div() };
+        let (range, _) = what.slider();
+        // A typed value past either end leaves the thumb at that end.
+        let along = ((value - range.start()) / (range.end() - range.start())).clamp(0.0, 1.0);
+
+        // Painted over the whole slider to follow the mouse, off the track too
+        // while it is dragged.
+        let bridge = cx.entity();
+        let dragging = dragged.is_some();
+        let mouse = canvas(
+            |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+            move |bounds, hitbox, window, _| {
+                window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
+                let along = move |event_x| {
+                    let track = f32::from(bounds.size.width) - 2.0 * THUMB_REACH;
+                    (f32::from(event_x - bounds.left()) - THUMB_REACH) / track.max(1.0)
+                };
+                let pressed = bridge.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
+                        return;
+                    }
+                    match event.button {
+                        MouseButton::Left => pressed.update(cx, |this, cx| this.drag(what, along(event.position.x), cx)),
+                        MouseButton::Right => pressed.update(cx, |this, cx| this.open_exact(what, window, cx)),
+                        _ => {}
+                    }
+                });
+                if !dragging {
+                    return;
+                }
+                let moved = bridge.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Bubble {
+                        return;
+                    }
+                    moved.update(cx, |this, cx| match event.pressed_button {
+                        Some(MouseButton::Left) => this.drag(what, along(event.position.x), cx),
+                        // Let go where we were not told, outside the window.
+                        _ => this.end_drag(cx),
+                    });
+                });
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble && event.button == MouseButton::Left {
+                        bridge.update(cx, |this, cx| this.end_drag(cx));
+                    }
+                });
+            },
+        )
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left(px(-THUMB_REACH))
+        .right(px(-THUMB_REACH));
+
+        let thumb = 2.0 * THUMB_REACH;
+        let track = div()
+            .id(id)
+            .relative()
+            .flex_1()
+            .flex()
+            .items_center()
+            .h(px(28.))
+            .mx(px(THUMB_REACH))
+            .child(
+                div()
+                    .w_full()
+                    .h(px(4.))
+                    .rounded_full()
+                    .bg(rgb(theme::FIELD_HOVER))
+                    .child(div().h_full().w(relative(along)).rounded_full().bg(rgb(theme::ACCENT))),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px((28. - thumb) / 2.))
+                    .left(relative(along))
+                    .ml(px(-THUMB_REACH))
+                    .size(px(thumb))
+                    .rounded_full()
+                    .bg(rgb(if dragging { theme::ACCENT_HOVER } else { theme::TEXT })),
+            )
+            .child(mouse);
+        div().flex().items_center().gap_2().child(track).child(
+            div().flex_none().w(px(60.)).flex().justify_end().text_size(px(13.)).child(what.label(value)),
+        )
+    }
+
     /// The current device, expanding in place into the list of alternatives.
     fn device_picker(
         &self,
@@ -689,6 +999,8 @@ impl Bridge {
                         this.settings.sources.remove(index);
                     }
                     this.open_picker = None;
+                    // The ones after it are numbered anew.
+                    (this.exact, this.drag) = (None, None);
                     this.settings_changed(cx);
                 }));
             let mut block = div()
@@ -747,26 +1059,7 @@ impl Bridge {
                 "Background noise is taken out from under the voice and nothing is cut off. \
                  Typing and clicks still come through in part. Adds about {delay} ms of delay."
             ))),
-            Mode::Gate(gate) => {
-                // Each row changes one thing about the gate.
-                let tune = |id: ElementId,
-                            options: &[(f32, &'static str)],
-                            current: f32,
-                            set: fn(&mut Gate, f32),
-                            cx: &mut Context<Self>| {
-                    let pick = cx.listener(move |this, &value: &f32, _, cx| {
-                        let change = |tuning: &mut Tuning| {
-                            if let Mode::Gate(gate) = &mut tuning.denoise {
-                                set(gate, value);
-                            }
-                        };
-                        this.tune(mic, change, cx);
-                    });
-                    segmented(id, options, current, pick)
-                };
-                let ms = |choices: &[(u32, &'static str)]| -> Vec<(f32, &'static str)> {
-                    choices.iter().map(|&(ms, label)| (ms as f32, label)).collect()
-                };
+            Mode::Gate(_) => {
                 let tuned = !DENOISE_CHOICES.iter().any(|&(mode, _)| mode == tuning.denoise);
                 block
                     .child(detail(format!(
@@ -774,37 +1067,19 @@ impl Bridge {
                          Adds about {delay} ms of delay.",
                         if tuned { "Your own tuning. " } else { "" }
                     )))
-                    .child(tune(
-                        id("gate-lookahead", "remote-gate-lookahead"),
-                        &ms(&LOOKAHEAD_CHOICES),
-                        gate.lookahead_ms as f32,
-                        |gate, ms| gate.lookahead_ms = ms as u32,
-                        cx,
-                    ))
+                    .child(self.number_row(id("gate-lookahead", "remote-gate-lookahead"), Exact::Lookahead(mic), cx))
                     .child(detail(
                         "How far it listens ahead. More keeps the start of a word after a pause, \
                          and delays the voice as much.",
                     ))
-                    .child(tune(
-                        id("gate-hold", "remote-gate-hold"),
-                        &ms(&HOLD_CHOICES),
-                        gate.hold_ms as f32,
-                        |gate, ms| gate.hold_ms = ms as u32,
-                        cx,
-                    ))
+                    .child(self.number_row(id("gate-hold", "remote-gate-hold"), Exact::Hold(mic), cx))
                     .child(detail(
                         "How long it stays open after the voice stops. More bridges longer gaps, \
                          and lets more noise trail a phrase.",
                     ))
-                    .child(tune(
-                        id("gate-threshold", "remote-gate-threshold"),
-                        &THRESHOLD_CHOICES,
-                        gate.threshold,
-                        |gate, level| gate.threshold = level,
-                        cx,
-                    ))
+                    .child(self.number_row(id("gate-threshold", "remote-gate-threshold"), Exact::Threshold(mic), cx))
                     .child(detail(
-                        "How sure it must be that it hears a voice. Lenient opens for quiet speech, \
+                        "How sure it must be that it hears a voice. Lower opens for quiet speech, \
                          and for more that is not speech.",
                     ))
             }
@@ -813,8 +1088,7 @@ impl Bridge {
         let pick =
             cx.listener(move |this, &auto_gain: &bool, _, cx| this.tune(mic, |tuning| tuning.auto_gain = auto_gain, cx));
         let block = block.child(segmented(id("auto-gain", "remote-auto-gain"), &options, tuning.auto_gain, pick));
-        let pick = cx.listener(move |this, &gain_db: &i32, _, cx| this.tune(mic, |tuning| tuning.gain_db = gain_db, cx));
-        block.child(segmented(id("gain", "remote-gain"), &GAIN_CHOICES, tuning.gain_db, pick)).child(detail(
+        block.child(self.number_row(id("gain", "remote-gain"), Exact::Gain(mic), cx)).child(detail(
             match (tuning.auto_gain, tuning.gain_db) {
                 (true, 0) => "Speech is brought to a steady level, however quiet the microphone is.",
                 (true, _) => "Speech is brought to a steady level, then louder or quieter by this much.",
@@ -951,17 +1225,22 @@ impl Bridge {
     }
 
     fn buffer_section(&self, cx: &mut Context<Self>) -> Div {
-        let pick = cx.listener(|this, &ms: &Option<u32>, _, cx| {
-            this.settings.buffer_ms = ms;
+        let pick = cx.listener(|this, &fixed: &bool, _, cx| {
+            this.settings.buffer_ms = fixed.then_some(this.settings.buffer_ms.unwrap_or(BUFFER_MS));
             this.open_picker = None;
+            if this.exact.as_ref().is_some_and(|exact| exact.what == Exact::Buffer) {
+                this.exact = None;
+            }
             this.settings_changed(cx);
         });
         let hint = match self.settings.buffer_ms {
             None => "Follows the network: as small as it allows, larger when it gets rough.",
             Some(_) => "Fixed. Lower is less delay; too low for the network and audio breaks up.",
         };
+        let fixed = self.settings.buffer_ms.is_some();
         section("JITTER BUFFER")
-            .child(segmented("buffer", &BUFFER_CHOICES, self.settings.buffer_ms, pick))
+            .child(segmented("buffer", &BUFFER_CHOICES, fixed, pick))
+            .when(fixed, |section| section.child(self.number_row("buffer-ms", Exact::Buffer, cx)))
             .child(detail(hint))
     }
 
@@ -1166,6 +1445,23 @@ impl Render for Bridge {
             .bg(rgb(theme::BACKGROUND))
             .text_color(rgb(theme::TEXT))
             .child(column)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_numbers_as_they_are_typed() {
+        assert_eq!(parse_number(" 7 "), Some(7.0));
+        assert_eq!(parse_number("+6 dB"), Some(6.0));
+        assert_eq!(parse_number("-3,5"), Some(-3.5));
+        assert_eq!(parse_number("\u{2212}12dB"), Some(-12.0));
+        assert_eq!(parse_number("35ms"), Some(35.0));
+        for junk in ["", "dB", "loud", "inf", "NaN", "1 2"] {
+            assert_eq!(parse_number(junk), None, "{junk:?}");
+        }
     }
 }
 

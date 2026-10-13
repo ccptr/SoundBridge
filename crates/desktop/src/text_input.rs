@@ -1,7 +1,8 @@
 //! A single-line text field. gpui ships no text widget; this is its upstream
 //! `input` example (Apache-2.0) made reusable: restyled, given a small API
 //! ([`TextInput::content`], [`TextInput::set_content`]) and a [`Submitted`]
-//! event for Enter. Editing key bindings are registered by [`bind_keys`].
+//! event for Enter and a [`Cancelled`] one for Escape. Editing key bindings are
+//! registered by [`bind_keys`].
 
 use std::ops::Range;
 
@@ -33,6 +34,7 @@ actions!(
         Cut,
         Copy,
         Submit,
+        Cancel,
     ]
 );
 
@@ -49,6 +51,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("home", Home, context),
         KeyBinding::new("end", End, context),
         KeyBinding::new("enter", Submit, context),
+        KeyBinding::new("escape", Cancel, context),
         KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, context),
     ]);
     // The platform's own modifier on macOS, Control everywhere else.
@@ -66,6 +69,11 @@ pub fn bind_keys(cx: &mut App) {
 pub struct Submitted;
 
 impl EventEmitter<Submitted> for TextInput {}
+
+/// Emitted when Escape is pressed in the field.
+pub struct Cancelled;
+
+impl EventEmitter<Cancelled> for TextInput {}
 
 pub struct TextInput {
     focus_handle: FocusHandle,
@@ -107,8 +115,18 @@ impl TextInput {
         cx.notify();
     }
 
+    /// Selects everything, so that typing replaces it.
+    pub fn select_all_content(&mut self, cx: &mut Context<Self>) {
+        self.move_to(0, cx);
+        self.select_to(self.content.len(), cx)
+    }
+
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(Submitted);
+    }
+
+    fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(Cancelled);
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -136,8 +154,7 @@ impl TextInput {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(0, cx);
-        self.select_to(self.content.len(), cx)
+        self.select_all_content(cx)
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
@@ -641,6 +658,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::cancel))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
