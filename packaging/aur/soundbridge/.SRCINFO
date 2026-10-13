@@ -1,6 +1,6 @@
 pkgbase = soundbridge
 	pkgdesc = Low-latency audio link between a phone and a PC: command-line tool and desktop app
-	pkgver = 0.3.0
+	pkgver = 0.4.0
 	pkgrel = 1
 	url = https://github.com/ccptr/SoundBridge
 	arch = x86_64
@@ -21,7 +21,7 @@ pkgbase = soundbridge
 	depends = wayland
 	optdepends = pipewire-audio: pw-loopback, for the virtual microphone
 	options = !lto
-	source = soundbridge::git+https://github.com/ccptr/SoundBridge.git#tag=v0.3.0
+	source = soundbridge::git+https://github.com/ccptr/SoundBridge.git#tag=v0.4.0
 	sha256sums = SKIP
 
 pkgname = soundbridge
