@@ -1283,19 +1283,28 @@ impl Bridge {
             let placed = self.settings.play_streams.iter().find(|stream| stream.source == source);
             let route = placed.map(|stream| stream.route.clone()).unwrap_or_default();
             let name: SharedString = match route.play {
-                Play::Off => "Nothing".into(),
                 Play::Speaker if route.device.is_none() => "Default output".into(),
                 Play::Speaker => self.device_name(&route.device, DeviceDirection::Output),
-                Play::VirtualMic => "Virtual microphone".into(),
+                Play::Off | Play::VirtualMic => "No output device".into(),
             };
             let outputs = (self.device_choices(DeviceDirection::Output)).map(|(device, name)| match device {
                 None => (Route::default(), "Default output".into()),
                 device => (Route { play: Play::Speaker, device }, name),
             });
-            let choices = std::iter::once((nothing.clone(), "Nothing".into()))
-                .chain(outputs)
-                // Only PipeWire lets us create the device ourselves.
-                .chain(cfg!(target_os = "linux").then(|| (virtual_mic.clone(), "Virtual microphone".into())));
+            let place = |what: &'static str, label: &'static str, to: &Route, cx: &mut Context<Self>| {
+                let (source, to) = (source.clone(), to.clone());
+                button(ElementId::Name(format!("{what} {source}").into()), label, route == to).flex_1().on_click(
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.open_picker = None;
+                        this.set_route(source.clone(), to.clone(), cx);
+                    }),
+                )
+            };
+            let mut places = div().flex().gap_2().child(place("stream-nothing", "Nothing", &nothing, cx));
+            // Only PipeWire lets us create the device ourselves.
+            if cfg!(target_os = "linux") {
+                places = places.child(place("stream-virtual-mic", "Virtual microphone", &virtual_mic, cx));
+            }
             let pick = {
                 let source = source.clone();
                 move |this: &mut Self, route: Route, cx: &mut Context<Self>| this.set_route(source.clone(), route, cx)
@@ -1305,7 +1314,7 @@ impl Bridge {
             if title != source {
                 block = block.child(detail(source.clone()).truncate());
             }
-            let block = block.child(self.picker(Picker::Stream(source), &route, name, choices, pick, cx));
+            let block = block.child(places).child(self.picker(Picker::Stream(source), &route, name, outputs, pick, cx));
             section = section.child(match route.play {
                 Play::VirtualMic => block.child(detail(
                     "Appears to other apps as the input device \"SoundBridge Microphone\" while connected.",

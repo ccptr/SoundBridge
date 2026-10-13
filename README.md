@@ -70,9 +70,9 @@ soundbridge listen --play HEADSET:virtual-mic --play WEBCAM:speaker=ID --play sp
 ```
 
 - The desktop app lists each stream the other device sends under its name,
-  with one list to choose from: nothing, the default output, each output
-  device, and the virtual microphone. What was chosen is kept with the
-  source's id for the next time that device sends it.
+  with a button for nothing, a button for the virtual microphone, and a
+  list of the output devices, the default one first. What was chosen is
+  kept with the source's id for the next time that device sends it.
 - A stream that is given no place plays on the default output in the desktop
   app, and on the command line wherever a `--play` without a source says
   (`--play speaker` if there is none). Above, that is what the PC plays.
