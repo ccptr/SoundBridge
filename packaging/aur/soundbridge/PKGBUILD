@@ -1,7 +1,7 @@
 # Maintainer: ccptr <cccptr@protonmail.com>
 
 pkgname=soundbridge
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Low-latency audio link between a phone and a PC: command-line tool and desktop app"
 arch=('x86_64' 'aarch64')
