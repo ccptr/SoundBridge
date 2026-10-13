@@ -5551,7 +5551,7 @@ dependencies = [
 
 [[package]]
 name = "soundbridge-android"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "jni 0.21.1",
  "ndk",
@@ -5561,7 +5561,7 @@ dependencies = [
 
 [[package]]
 name = "soundbridge-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "ctrlc",
@@ -5571,7 +5571,7 @@ dependencies = [
 
 [[package]]
 name = "soundbridge-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cpal",
  "if-addrs",
@@ -5583,7 +5583,7 @@ dependencies = [
 
 [[package]]
 name = "soundbridge-desktop"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-channel 2.5.0",
  "gpui",
@@ -5594,7 +5594,7 @@ dependencies = [
 
 [[package]]
 name = "soundbridge-update"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "flate2",
  "tar",
