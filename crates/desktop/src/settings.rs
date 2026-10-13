@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use soundbridge_core::denoise::Mode;
+use soundbridge_core::protocol::MAX_STREAMS;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Kind {
@@ -42,6 +43,14 @@ pub struct Route {
     pub device: Option<String>,
 }
 
+/// Where one of the other device's streams goes, instead of where its kind does.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StreamRoute {
+    /// Which stream, counted from 0 in the order the other device sends them.
+    pub slot: u8,
+    pub route: Route,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
     pub sources: Vec<Source>,
@@ -49,6 +58,8 @@ pub struct Settings {
     pub play_mic: Route,
     /// What the other device is playing.
     pub play_system: Route,
+    /// Streams played somewhere of their own. One listed twice plays in both places.
+    pub play_streams: Vec<StreamRoute>,
     /// Fixed jitter buffer in ms, or `None` for automatic.
     pub buffer_ms: Option<u32>,
     /// The last address typed into the connect box.
@@ -120,6 +131,14 @@ impl Settings {
                 "play_mic_device" => s.play_mic.device = device(value),
                 "play_system" => s.play_system.play = play(value),
                 "play_system_device" => s.play_system.device = device(value),
+                // number|play|device, the number counted from 1 as it is shown.
+                "play_stream" => {
+                    let mut fields = value.splitn(3, '|');
+                    let number = fields.next().and_then(|n| n.parse::<usize>().ok());
+                    let Some(slot) = number.filter(|n| (1..=MAX_STREAMS).contains(n)) else { continue };
+                    let route = Route { play: play(fields.next().unwrap_or_default()), device: fields.next().and_then(device) };
+                    s.play_streams.push(StreamRoute { slot: slot as u8 - 1, route });
+                }
                 "buffer_ms" => s.buffer_ms = value.parse().ok(),
                 "host" => s.host = value.to_string(),
                 _ => {}
@@ -148,6 +167,10 @@ impl Settings {
                 source.gain_db,
                 device(&source.device)
             );
+        }
+        for stream in &self.play_streams {
+            let route = &stream.route;
+            out += &format!("play_stream={}|{}|{}\n", stream.slot as usize + 1, play(route.play), device(&route.device));
         }
         out + &format!(
             "play_mic={}\nplay_mic_device={}\nplay_system={}\nplay_system_device={}\nbuffer_ms={}\nhost={}\n",
@@ -190,6 +213,11 @@ mod tests {
             ],
             play_mic: Route { play: Play::VirtualMic, device: None },
             play_system: Route { play: Play::Speaker, device: Some("wasapi:{0.0.0.00000000}.{a=b}".into()) },
+            play_streams: vec![
+                StreamRoute { slot: 1, route: Route { play: Play::Speaker, device: Some("pipewire:a|b".into()) } },
+                StreamRoute { slot: 1, route: Route::default() },
+                StreamRoute { slot: 63, route: Route { play: Play::Off, device: None } },
+            ],
             buffer_ms: Some(10),
             host: "192.168.1.20:47800".into(),
         };
@@ -218,7 +246,8 @@ mod tests {
 
     #[test]
     fn tolerates_junk() {
-        let s = Settings::parse("nonsense\nsource=loud\nsend=mic\nbuffer_ms=soon\nplay_mic=off\n");
+        let junk = "nonsense\nsource=loud\nsend=mic\nbuffer_ms=soon\nplay_mic=off\nplay_stream=0|off|\nplay_stream=x\n";
+        let s = Settings::parse(junk);
         let play_mic = Route { play: Play::Off, device: None };
         assert_eq!(s, Settings { play_mic, ..Settings::default() });
     }

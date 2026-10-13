@@ -13,8 +13,9 @@ use soundbridge_core::denoise::{Gate, Mode};
 use soundbridge_core::gain::OFFSET_RANGE_DB;
 use soundbridge_core::{
     AudioBackend, BufferMode, Config, DEFAULT_PORT, DeviceDirection, Engine, Event, SinkConfig,
-    SinkKind, SourceConfig, SourceKind, State, Stats, StreamFormat,
+    SinkKind, SourceConfig, SourceKind, State, Stats, StreamFormat, Streams,
 };
+use soundbridge_core::protocol::MAX_STREAMS;
 
 /// A low-latency audio bridge between machines on the same network.
 ///
@@ -35,6 +36,11 @@ Examples:
 
   The same, while also hearing what the phone is playing:
     soundbridge listen --play mic:virtual-mic --play system:speaker
+
+  Send two microphones, and at the other end play the second on a device of
+  its own and the rest on the default one:
+    soundbridge connect 192.168.1.20 --send mic=ID --send mic=OTHER
+    soundbridge listen --play 2:speaker=ID --play speaker
 
   Hear this PC on the phone (the phone is listening):
     soundbridge connect 192.168.1.20 --send system --play none
@@ -91,6 +97,9 @@ enum Command {
     /// and install it in the background, for the next start.
     #[cfg(feature = "self-update")]
     Update {
+        /// Say whether there is a newer release, without installing it
+        #[arg(long, conflicts_with = "auto")]
+        check: bool,
         /// Whether updates install themselves from now on, instead of updating now
         #[arg(long, value_name = "on|off", value_parser = parse_switch)]
         auto: Option<bool>,
@@ -113,11 +122,11 @@ struct Source {
     device: Option<String>,
 }
 
-/// One `--play`: where streams go, and optionally which kind and on which
-/// device. No sink is `none`.
+/// One `--play`: where streams go, and optionally which of them and on
+/// which device. No sink is `none`.
 #[derive(Clone)]
 struct Sink {
-    from: Option<SourceKind>,
+    from: Streams,
     kind: Option<SinkKind>,
     device: Option<String>,
 }
@@ -148,8 +157,8 @@ fn parse_source(s: &str) -> Result<Source, String> {
 fn parse_sink(s: &str) -> Result<Sink, String> {
     let (what, device) = split_device(s);
     let (from, sink) = match what.split_once(':') {
-        Some((from, sink)) => (Some(parse_kind(from)?), sink),
-        None => (None, what),
+        Some((from, sink)) => (parse_streams(from)?, sink),
+        None => (Streams::All, what),
     };
     let kind = match sink {
         "speaker" => Some(SinkKind::Speaker),
@@ -159,6 +168,18 @@ fn parse_sink(s: &str) -> Result<Sink, String> {
         _ => return Err(format!("'{sink}' is not a sink: expected speaker, virtual-mic, null or none")),
     };
     Ok(Sink { from, kind, device })
+}
+
+/// The part of a `--play` before the colon: a kind of source, or the number
+/// of one of the peer's streams, counted from 1.
+fn parse_streams(s: &str) -> Result<Streams, String> {
+    if !s.starts_with(|c: char| c.is_ascii_digit()) {
+        return parse_kind(s).map(Streams::Kind);
+    }
+    match s.parse::<usize>() {
+        Ok(number) if (1..=MAX_STREAMS).contains(&number) => Ok(Streams::Slot(number as u8 - 1)),
+        _ => Err(format!("'{s}' is not a stream: they are numbered 1 to {MAX_STREAMS}")),
+    }
 }
 
 #[derive(Args)]
@@ -213,8 +234,10 @@ struct LinkArgs {
     /// from; PipeWire), `null` (receive and measure, play nothing) or `none`
     /// (ignore it). Add `=ID` to pick the device. Prefix `mic:` or `system:`
     /// to play only that kind of stream there, and repeat to send each kind
-    /// somewhere else
-    #[arg(short, long, value_name = "[KIND:]SINK[=ID]", default_value = "speaker", value_parser = parse_sink)]
+    /// somewhere else. Prefix a number to play one stream there, the peer's
+    /// first --send being `1:`; that stream then plays nowhere else, and
+    /// with `none` nowhere at all
+    #[arg(short, long, value_name = "[KIND|N:]SINK[=ID]", default_value = "speaker", value_parser = parse_sink)]
     play: Vec<Sink>,
 
     /// Jitter buffer: `auto` adapts to the network, or a fixed size in ms
@@ -321,7 +344,13 @@ impl LinkArgs {
                 .collect(),
             play: (self.play.iter())
                 .filter_map(|sink| {
-                    Some(SinkConfig { kind: sink.kind?, device: sink.device.clone(), from: sink.from })
+                    let kind = match (sink.kind, sink.from) {
+                        (Some(kind), _) => kind,
+                        // Said of one stream, `none` takes it off the other sinks.
+                        (None, Streams::Slot(_)) => SinkKind::Nothing,
+                        (None, _) => return None,
+                    };
+                    Some(SinkConfig { kind, device: sink.device.clone(), from: sink.from })
                 })
                 .collect(),
             packet_ms: self.packet,
@@ -365,7 +394,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         #[cfg(feature = "self-update")]
-        Command::Update { auto } => update(auto),
+        Command::Update { check, auto } => update(check, auto),
     };
     // Said on the way out, where it cannot land in the statistics line.
     #[cfg(feature = "self-update")]
@@ -393,8 +422,15 @@ fn auto_update() -> mpsc::Receiver<soundbridge_update::Version> {
 }
 
 #[cfg(feature = "self-update")]
-fn update(auto: Option<bool>) -> Result<(), String> {
+fn update(check: bool, auto: Option<bool>) -> Result<(), String> {
     use soundbridge_update::Outcome;
+    if check {
+        match soundbridge_update::check()? {
+            Some(version) => println!("{version} has been released; `soundbridge update` installs it"),
+            None => println!("{} is the latest release", soundbridge_update::Version::current()),
+        }
+        return Ok(());
+    }
     if let Some(auto) = auto {
         soundbridge_update::set_auto_enabled(auto);
     }
@@ -565,7 +601,7 @@ impl Status {
                 Mode::Reduce => " less noise",
                 Mode::Gate(_) => " voice only",
             };
-            let mut part = format!("send {}{filtered} {}", stream(tx.kind, tx.format, brief), meter(tx.level));
+            let mut part = format!("send {}{filtered} {}", stream(tx.slot, tx.kind, tx.format, brief), meter(tx.level));
             if let Some(remote) = tx.remote.filter(|_| !brief) {
                 part += &format!(" > peer buffer {:.1} ms", remote.buffer_us as f32 / 1000.0);
                 if remote.lost > 0 || remote.underruns > 0 {
@@ -578,7 +614,7 @@ impl Status {
             let state = if rx.playing { "" } else { " (buffering)" };
             let mut part = format!(
                 "recv {} {} buffer {:.1} ms{state}",
-                stream(rx.kind, rx.format, brief),
+                stream(rx.slot, rx.kind, rx.format, brief),
                 meter(rx.level),
                 rx.buffer_ms
             );
@@ -608,14 +644,15 @@ impl Status {
     }
 }
 
-/// Names a stream by what it carries: at length, or just its kind.
-fn stream(kind: SourceKind, format: StreamFormat, brief: bool) -> String {
+/// Names a stream by what it carries: at length, or just its kind, behind
+/// the number `--play N:` knows it by.
+fn stream(slot: u8, kind: SourceKind, format: StreamFormat, brief: bool) -> String {
     let kind = match kind {
         SourceKind::Mic => "mic",
         SourceKind::System => "system",
         SourceKind::Tone => "tone",
     };
-    if brief { kind.to_string() } else { format!("{kind} {format}") }
+    if brief { format!("{}:{kind}", slot + 1) } else { format!("{kind} {format}") }
 }
 
 /// A five-step level meter covering roughly the top 40 dB.
@@ -659,12 +696,44 @@ mod tests {
         assert!(parse_source("loud").is_err());
 
         let sink = parse_sink("mic:virtual-mic").unwrap();
-        assert_eq!((sink.from, sink.kind), (Some(SourceKind::Mic), Some(SinkKind::VirtualMic)));
+        assert_eq!((sink.from, sink.kind), (Streams::Kind(SourceKind::Mic), Some(SinkKind::VirtualMic)));
         let sink = parse_sink("speaker=wasapi:{0.0}").unwrap();
-        assert_eq!((sink.from, sink.kind, sink.device.as_deref()), (None, Some(SinkKind::Speaker), Some("wasapi:{0.0}")));
+        assert_eq!(
+            (sink.from, sink.kind, sink.device.as_deref()),
+            (Streams::All, Some(SinkKind::Speaker), Some("wasapi:{0.0}"))
+        );
         assert!(parse_sink("none").unwrap().kind.is_none());
         assert!(parse_sink("mic:loud").is_err());
         assert!(parse_sink("loud:speaker").is_err());
+
+        // Streams are counted from 1 on the command line, slots from 0.
+        let sink = parse_sink("2:speaker=pipewire:out:1").unwrap();
+        assert_eq!(
+            (sink.from, sink.kind, sink.device.as_deref()),
+            (Streams::Slot(1), Some(SinkKind::Speaker), Some("pipewire:out:1"))
+        );
+        assert!(parse_sink("0:speaker").is_err());
+        assert!(parse_sink("65:speaker").is_err());
+        assert!(parse_sink("2nd:speaker").is_err());
+    }
+
+    #[test]
+    fn one_stream_somewhere_else_or_nowhere() {
+        let cli = Cli::try_parse_from([
+            "soundbridge", "listen", "--play", "1:virtual-mic", "--play", "3:none", "--play", "mic:none", "--play",
+            "speaker",
+        ])
+        .unwrap();
+        let Command::Listen { link, .. } = cli.command else { panic!() };
+        let played: Vec<_> = link.config(0, true).play.iter().map(|s| (s.from, s.kind)).collect();
+        assert_eq!(
+            played,
+            [
+                (Streams::Slot(0), SinkKind::VirtualMic),
+                (Streams::Slot(2), SinkKind::Nothing),
+                (Streams::All, SinkKind::Speaker)
+            ]
+        );
     }
 
     #[test]
@@ -693,7 +762,10 @@ mod tests {
         let played: Vec<_> = config.play.iter().map(|s| (s.from, s.kind)).collect();
         assert_eq!(
             played,
-            [(Some(SourceKind::Mic), SinkKind::VirtualMic), (Some(SourceKind::System), SinkKind::Speaker)]
+            [
+                (Streams::Kind(SourceKind::Mic), SinkKind::VirtualMic),
+                (Streams::Kind(SourceKind::System), SinkKind::Speaker)
+            ]
         );
 
         // With nothing said, received audio goes to the speakers.

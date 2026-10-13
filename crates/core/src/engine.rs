@@ -10,8 +10,9 @@
 //! playing; "PC audio to phone" is the reverse; both at once is both.
 //!
 //! Either list can be any length. Every source is its own stream, numbered
-//! by its place in the list (its slot), and every arriving stream is played
-//! on each sink that takes its kind.
+//! by its place in the list (its slot). An arriving stream is played on the
+//! sinks that name its slot, or failing those on each sink that takes its
+//! kind.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -81,17 +82,39 @@ impl SourceConfig {
     }
 }
 
+/// Which of the peer's streams a sink plays.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Streams {
+    #[default]
+    All,
+    /// Those of one kind.
+    Kind(SourceKind),
+    /// The one the peer sends in this slot, whatever it carries. A stream
+    /// that any sink names this way is played on such sinks only.
+    Slot(u8),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SinkConfig {
     pub kind: SinkKind,
     pub device: Option<String>,
-    /// The kind of stream played here; `None` plays every stream.
-    pub from: Option<SourceKind>,
+    pub from: Streams,
 }
 
 impl SinkConfig {
     pub fn new(kind: SinkKind) -> Self {
-        SinkConfig { kind, device: None, from: None }
+        SinkConfig { kind, device: None, from: Streams::All }
+    }
+
+    /// Whether the stream in `slot` is played here; `named` says that some
+    /// sink asks for that slot.
+    fn takes(&self, slot: u8, kind: SourceKind, named: bool) -> bool {
+        self.kind != SinkKind::Nothing
+            && match self.from {
+                Streams::Slot(wanted) => wanted == slot,
+                Streams::Kind(wanted) => !named && wanted == kind,
+                Streams::All => !named,
+            }
     }
 }
 
@@ -112,7 +135,8 @@ pub struct Config {
     /// [`MAX_STREAMS`](protocol::MAX_STREAMS) are used.
     pub send: Vec<SourceConfig>,
     /// Where received streams go. A stream is played on every sink that
-    /// takes its kind, and dropped if none does.
+    /// names its slot, or with none that does on every sink that takes its
+    /// kind, and dropped if there is none of either.
     pub play: Vec<SinkConfig>,
     /// Audio per packet. Smaller is lower latency and more packets.
     pub packet_ms: f32,
@@ -445,8 +469,8 @@ impl Worker {
     }
 
     fn caps(&self) -> u8 {
-        (if self.config.send.is_empty() { 0 } else { CAP_SENDS })
-            | (if self.config.play.is_empty() { 0 } else { CAP_PLAYS })
+        let plays = self.config.play.iter().any(|sink| sink.kind != SinkKind::Nothing);
+        (if self.config.send.is_empty() { 0 } else { CAP_SENDS }) | (if plays { CAP_PLAYS } else { 0 })
     }
 
     fn command(&mut self, cmd: Command) {
@@ -861,8 +885,9 @@ impl Worker {
         session.last_heard = now;
         // The sender put a different kind of source in this slot: route it afresh.
         session.rx.retain(|rx| rx.slot != header.slot || rx.kind == header.kind);
+        let named = self.config.play.iter().any(|sink| sink.from == Streams::Slot(header.slot));
         for (sink, config) in self.config.play.iter().enumerate() {
-            if config.from.is_some_and(|kind| kind != header.kind) {
+            if !config.takes(header.slot, header.kind, named) {
                 continue;
             }
             let found = session.rx.iter().position(|rx| rx.slot == header.slot && rx.sink == sink);

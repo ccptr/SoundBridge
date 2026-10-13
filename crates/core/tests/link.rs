@@ -10,7 +10,7 @@ use soundbridge_core::audio::{MakeCapture, MakeRender};
 use soundbridge_core::denoise;
 use soundbridge_core::{
     AudioBackend, CaptureRequest, Config, DeviceInfo, Engine, Event, PlaybackRequest, SinkConfig,
-    SinkKind, SourceConfig, SourceKind, State, Stats, StreamHandle,
+    SinkKind, SourceConfig, SourceKind, State, Stats, StreamHandle, Streams,
 };
 
 /// The synthetic source and sink live in the engine; nothing here should
@@ -146,8 +146,8 @@ fn several_streams_one_way_each_go_where_their_kind_is_played() {
     let (listener, listener_events) = engine(Config {
         play: vec![
             SinkConfig::new(SinkKind::Null),
-            SinkConfig { from: Some(SourceKind::Tone), ..SinkConfig::new(SinkKind::Null) },
-            SinkConfig { from: Some(SourceKind::Mic), ..SinkConfig::new(SinkKind::Null) },
+            SinkConfig { from: Streams::Kind(SourceKind::Tone), ..SinkConfig::new(SinkKind::Null) },
+            SinkConfig { from: Streams::Kind(SourceKind::Mic), ..SinkConfig::new(SinkKind::Null) },
         ],
         ..config("listener")
     });
@@ -189,6 +189,49 @@ fn several_streams_one_way_each_go_where_their_kind_is_played() {
         Event::Stats(Stats { rx, .. }) if rx.len() == 4 => Some(()),
         _ => None,
     });
+}
+
+#[test]
+fn a_stream_named_by_slot_goes_only_where_it_is_sent() {
+    let null = |from| SinkConfig { from, ..SinkConfig::new(SinkKind::Null) };
+    let (listener, listener_events) = engine(Config {
+        // Sinks 0 and 1 take the second stream away from sink 2, which is
+        // left with the first; the third goes nowhere.
+        play: vec![
+            null(Streams::Slot(1)),
+            null(Streams::Slot(1)),
+            null(Streams::All),
+            SinkConfig { from: Streams::Slot(2), ..SinkConfig::new(SinkKind::Nothing) },
+        ],
+        ..config("listener")
+    });
+    let (dialer, dialer_events) = engine(Config {
+        send: vec![tone_source(1), tone_source(2), tone_source(1)],
+        ..config("dialer")
+    });
+    dialer.connect(local(&listener));
+
+    // Long enough for a stream that should not play to have turned up.
+    let settle = Instant::now() + Duration::from_secs(1);
+    let mut rx = wait_for(&listener_events, "the streams to play", |e| match e {
+        Event::Stats(Stats { rx, .. }) if rx.len() > 3 => panic!("{} outputs", rx.len()),
+        Event::Stats(Stats { rx, .. })
+            if Instant::now() > settle && rx.len() == 3 && rx.iter().all(|rx| rx.playing) =>
+        {
+            Some(rx)
+        }
+        Event::Error(e) => panic!("{e}"),
+        _ => None,
+    });
+    rx.sort_by_key(|rx| rx.slot);
+    assert_eq!(rx.iter().map(|rx| (rx.slot, rx.format.channels)).collect::<Vec<_>>(), [(0, 1), (1, 2), (1, 2)]);
+
+    // The sender is told which of its streams is not played.
+    let tx = wait_for(&dialer_events, "reports on the played streams", |e| match e {
+        Event::Stats(Stats { tx, .. }) if tx.len() == 3 && tx[..2].iter().all(|tx| tx.remote.is_some()) => Some(tx),
+        _ => None,
+    });
+    assert_eq!(tx[2].remote, None);
 }
 
 #[test]

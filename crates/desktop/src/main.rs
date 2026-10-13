@@ -20,10 +20,11 @@ use soundbridge_core::cpal_backend::CpalBackend;
 use soundbridge_core::denoise::{Gate, Mode};
 use soundbridge_core::{
     AudioBackend, BufferMode, Config, DEFAULT_PORT, DeviceDirection, DeviceInfo, Engine, Event,
-    Peer, SinkConfig, SinkKind, SourceConfig, SourceKind, State, Stats,
+    Peer, SinkConfig, SinkKind, SourceConfig, SourceKind, State, Stats, Streams,
 };
+use soundbridge_core::protocol::MAX_STREAMS;
 
-use settings::{Kind, Play, Route, Settings, Source};
+use settings::{Kind, Play, Route, Settings, Source, StreamRoute};
 use text_input::{Submitted, TextInput};
 
 /// What a microphone can be filtered down to. A tuning that is none of
@@ -46,12 +47,25 @@ const BUFFER_CHOICES: [(Option<u32>, &str); 5] =
 #[cfg(feature = "self-update")]
 const UPDATE_CHOICES: [(bool, &str); 2] = [(true, "Automatic"), (false, "Off")];
 
-/// The device list that is open, if any: for one of the sources, or for
-/// where one kind of received stream is played.
+/// The device list that is open, if any: for one of the sources, for where
+/// one kind of received stream is played, or for where one stream is.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Picker {
     Source(usize),
     Sink(Kind),
+    Stream(usize),
+}
+
+/// How far a look for a new release, asked for by hand, has got.
+#[cfg(feature = "self-update")]
+enum UpdateCheck {
+    Idle,
+    Checking,
+    /// Nothing newer has been released.
+    Current,
+    Available(soundbridge_update::Version),
+    Installing(soundbridge_update::Version),
+    Failed(SharedString),
 }
 
 struct Notice {
@@ -82,6 +96,8 @@ struct Bridge {
     /// The release installed while the app was running, which it is not yet.
     #[cfg(feature = "self-update")]
     updated: Option<soundbridge_update::Version>,
+    #[cfg(feature = "self-update")]
+    update_check: UpdateCheck,
 }
 
 impl Bridge {
@@ -156,6 +172,8 @@ impl Bridge {
             auto_update: soundbridge_update::auto_enabled(),
             #[cfg(feature = "self-update")]
             updated: None,
+            #[cfg(feature = "self-update")]
+            update_check: UpdateCheck::Idle,
         };
         this.refresh_devices(cx);
         this
@@ -247,7 +265,50 @@ impl Bridge {
         match picker {
             Picker::Source(index) => self.settings.sources.get_mut(index).map(|s| &mut s.device),
             Picker::Sink(kind) => Some(&mut self.route_mut(kind).device),
+            Picker::Stream(index) => self.settings.play_streams.get_mut(index).map(|s| &mut s.route.device),
         }
+    }
+
+    /// Looks for a newer release without installing it.
+    #[cfg(feature = "self-update")]
+    fn check_for_update(&mut self, cx: &mut Context<Self>) {
+        self.update_check = UpdateCheck::Checking;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let found = cx.background_executor().spawn(async { soundbridge_update::check() }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.update_check = match found {
+                    Ok(Some(version)) => UpdateCheck::Available(version),
+                    Ok(None) => UpdateCheck::Current,
+                    Err(e) => UpdateCheck::Failed(format!("Could not look for a new release: {e}.").into()),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Installs the release a check found.
+    #[cfg(feature = "self-update")]
+    fn install_update(&mut self, version: soundbridge_update::Version, cx: &mut Context<Self>) {
+        use soundbridge_update::Outcome;
+        self.update_check = UpdateCheck::Installing(version);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let outcome = cx.background_executor().spawn(async { soundbridge_update::update() }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.update_check = match outcome {
+                    Ok(Outcome::Updated(version)) => {
+                        this.updated = Some(version);
+                        UpdateCheck::Idle
+                    }
+                    Ok(Outcome::Current(_)) => UpdateCheck::Current,
+                    Err(e) => UpdateCheck::Failed(format!("Could not install {version}: {e}.").into()),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn route(&self, kind: Kind) -> &Route {
@@ -321,16 +382,22 @@ fn sinks(settings: &Settings) -> Vec<SinkConfig> {
             Play::VirtualMic => SinkConfig { kind: SinkKind::VirtualMic, device: None, from },
         })
     };
+    // A stream with a place of its own, even if that is nowhere, is kept
+    // from where its kind goes.
+    let streams = settings.play_streams.iter().map(|stream| {
+        let from = Streams::Slot(stream.slot);
+        sink(&stream.route, from).unwrap_or(SinkConfig { from, ..SinkConfig::new(SinkKind::Nothing) })
+    });
     let (mic, system) = (
-        sink(&settings.play_mic, Some(SourceKind::Mic)),
-        sink(&settings.play_system, Some(SourceKind::System)),
+        sink(&settings.play_mic, Streams::Kind(SourceKind::Mic)),
+        sink(&settings.play_system, Streams::Kind(SourceKind::System)),
     );
     // Both kinds going to one place means everything does, test tones included.
-    let same = sink(&settings.play_mic, None);
-    if same.is_some() && same == sink(&settings.play_system, None) {
-        return same.into_iter().collect();
+    let same = sink(&settings.play_mic, Streams::All);
+    if same.is_some() && same == sink(&settings.play_system, Streams::All) {
+        return streams.chain(same).collect();
     }
-    mic.into_iter().chain(system).collect()
+    streams.chain(mic).chain(system).collect()
 }
 
 fn kind_name(kind: SourceKind) -> &'static str {
@@ -450,6 +517,7 @@ impl Bridge {
             Picker::Source(index) => ("source-device", index).into(),
             Picker::Sink(Kind::Mic) => "mic-sink-device".into(),
             Picker::Sink(Kind::System) => "system-sink-device".into(),
+            Picker::Stream(index) => ("stream-sink-device", index).into(),
         };
         let header = div()
             .id(id)
@@ -562,7 +630,7 @@ impl Bridge {
                         .flex()
                         .items_center()
                         .justify_between()
-                        .child(div().text_size(px(13.)).child(name))
+                        .child(div().text_size(px(13.)).child(format!("{name} · stream {}", index + 1)))
                         .child(remove),
                 )
                 .child(self.device_picker(Picker::Source(index), &source.device, direction, cx));
@@ -720,6 +788,85 @@ impl Bridge {
         }
     }
 
+    /// The streams that are played somewhere of their own, by number.
+    fn streams_section(&self, cx: &mut Context<Self>) -> Div {
+        let mut options = vec![(Play::Off, "Nothing"), (Play::Speaker, "Speakers")];
+        if cfg!(target_os = "linux") {
+            options.push((Play::VirtualMic, "Virtual mic"));
+        }
+        let mut section = section("PLAY ONE STREAM SOMEWHERE ELSE").child(detail(
+            "Streams are numbered in the order the other device sends them. One that is listed here \
+             plays where this says and not where its kind does; listed twice, in both places.",
+        ));
+        for (index, stream) in self.settings.play_streams.iter().enumerate() {
+            let link = |id: &'static str, label: &'static str| {
+                div()
+                    .id((id, index))
+                    .text_size(px(12.))
+                    .text_color(rgb(theme::MUTED))
+                    .hover(|s| s.text_color(rgb(theme::TEXT)))
+                    .cursor_pointer()
+                    .child(label)
+            };
+            let renumber = |id, label, by: i32, cx: &mut Context<Self>| {
+                link(id, label).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    if let Some(stream) = this.settings.play_streams.get_mut(index) {
+                        stream.slot = (stream.slot as i32 + by).clamp(0, MAX_STREAMS as i32 - 1) as u8;
+                    }
+                    this.settings_changed(cx);
+                }))
+            };
+            let remove = link("remove-stream", "Remove").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                if index < this.settings.play_streams.len() {
+                    this.settings.play_streams.remove(index);
+                }
+                this.open_picker = None;
+                this.settings_changed(cx);
+            }));
+            let pick = cx.listener(move |this, &play: &Play, _, cx| {
+                if let Some(stream) = this.settings.play_streams.get_mut(index) {
+                    stream.route.play = play;
+                }
+                this.open_picker = None;
+                this.settings_changed(cx);
+            });
+            let block = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(div().flex_1().text_size(px(13.)).child(format!("Stream {}", stream.slot + 1)))
+                        .child(renumber("stream-earlier", "Earlier", -1, cx))
+                        .child(renumber("stream-later", "Later", 1, cx))
+                        .child(remove),
+                )
+                .child(segmented(("play-stream", index), &options, stream.route.play, pick));
+            section = section.child(match stream.route.play {
+                Play::Speaker => block.child(self.device_picker(
+                    Picker::Stream(index),
+                    &stream.route.device,
+                    DeviceDirection::Output,
+                    cx,
+                )),
+                _ => block,
+            });
+        }
+        section.child(div().flex().child(button("add-stream", "Add a stream", false).on_click(cx.listener(
+            |this, _: &ClickEvent, _, cx| {
+                // The first one that has no place of its own yet.
+                let taken = |slot: &u8| this.settings.play_streams.iter().any(|s| s.slot == *slot);
+                let slot = (0..MAX_STREAMS as u8).find(|slot| !taken(slot)).unwrap_or(0);
+                this.settings.play_streams.push(StreamRoute { slot, route: Route::default() });
+                this.open_picker = None;
+                this.settings_changed(cx);
+            },
+        ))))
+    }
+
     fn buffer_section(&self, cx: &mut Context<Self>) -> Div {
         let pick = cx.listener(|this, &ms: &Option<u32>, _, cx| {
             this.settings.buffer_ms = ms;
@@ -747,7 +894,31 @@ impl Bridge {
             (None, true) => "New releases are looked for once a day and installed for the next start.".into(),
             (None, false) => format!("Stays at {} until this is turned back on.", env!("CARGO_PKG_VERSION")).into(),
         };
-        section("UPDATES").child(segmented("updates", &UPDATE_CHOICES, self.auto_update, pick)).child(detail(hint))
+        let section =
+            section("UPDATES").child(segmented("updates", &UPDATE_CHOICES, self.auto_update, pick)).child(detail(hint));
+        if self.updated.is_some() {
+            return section;
+        }
+        let current = env!("CARGO_PKG_VERSION");
+        let check = || {
+            button("check-update", "Check now", false)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.check_for_update(cx)))
+        };
+        let row = div().flex().items_center().gap_2();
+        section.child(match &self.update_check {
+            UpdateCheck::Idle => row.child(check()),
+            UpdateCheck::Checking => row.child(detail("Looking for a new release...")),
+            UpdateCheck::Current => row.child(check()).child(detail(format!("{current} is the latest release."))),
+            &UpdateCheck::Available(version) => row
+                .child(button("install-update", format!("Install {version}"), true).on_click(
+                    cx.listener(move |this, _: &ClickEvent, _, cx| this.install_update(version, cx)),
+                ))
+                .child(detail(format!("This is {current}."))),
+            UpdateCheck::Installing(version) => row.child(detail(format!("Installing {version}..."))),
+            UpdateCheck::Failed(error) => row.child(check()).child(
+                div().flex_1().text_size(px(12.)).text_color(rgb(theme::BAD)).child(error.clone()),
+            ),
+        })
     }
 
     fn peers_section(&self, cx: &mut Context<Self>) -> Div {
@@ -841,7 +1012,7 @@ impl Bridge {
 
             // What we receive.
             if self.stats.rx.is_empty() {
-                let ignoring = sinks(&self.settings).is_empty();
+                let ignoring = sinks(&self.settings).iter().all(|sink| sink.kind == SinkKind::Nothing);
                 section = section.child(detail(match ignoring {
                     true => "Ignoring incoming audio.",
                     false => "The other device is not sending anything played here.",
@@ -858,7 +1029,7 @@ impl Bridge {
                     SinkKind::VirtualMic => " · to the virtual mic",
                     _ => "",
                 };
-                let title = format!("Receiving {} · {}{to}", kind_name(rx.kind), rx.format);
+                let title = format!("Receiving stream {}, {} · {}{to}", rx.slot + 1, kind_name(rx.kind), rx.format);
                 section = section.child(
                     div()
                         .flex()
@@ -898,6 +1069,7 @@ impl Render for Bridge {
             .child(self.send_section(cx))
             .child(self.play_section(Kind::Mic, cx))
             .child(self.play_section(Kind::System, cx))
+            .child(self.streams_section(cx))
             .child(self.buffer_section(cx));
         #[cfg(feature = "self-update")]
         if self.self_updating {

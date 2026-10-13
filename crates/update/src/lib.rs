@@ -67,6 +67,13 @@ pub fn update() -> Result<Outcome, String> {
     update_from(Version::current(), &program_dir()?)
 }
 
+/// The latest release if it is newer than the running program, which is
+/// left as it is; [`update`] installs it.
+pub fn check() -> Result<Option<Version>, String> {
+    let latest = latest()?;
+    Ok(Some(latest).filter(|latest| *latest > Version::current()))
+}
+
 /// False for a copy that something else keeps current, which never updates
 /// itself.
 pub fn available() -> bool {

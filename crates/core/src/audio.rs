@@ -40,6 +40,9 @@ pub enum SinkKind {
     VirtualMic,
     /// Nowhere; the stream is clocked and measured but not heard.
     Null,
+    /// Nowhere at all: the stream is dropped as it arrives. For a sink that
+    /// names one stream, which keeps that stream off the other sinks.
+    Nothing,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

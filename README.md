@@ -16,8 +16,9 @@ of the protocol.
 Each end decides two things for itself: what it **sends** (any number of
 microphones and of whatever the machine is playing, each as its own stream)
 and where it **plays** what the other end sends, which can be a different
-place for microphones than for device audio. Then one end connects to the
-other. Nothing a peer says can make a device start recording.
+place for microphones than for device audio, and a place of its own for any
+one stream. Then one end connects to the other. Nothing a peer says can make
+a device start recording.
 
 | Goal | Phone | PC |
 |---|---|---|
@@ -36,6 +37,7 @@ soundbridge connect 192.168.1.20 --send system --play none   # PC: send its audi
 soundbridge discover                           # who is listening?
 soundbridge devices                            # device ids for --send mic=ID / --play speaker=ID
 soundbridge listen --play mic:virtual-mic --play system:speaker   # each kind of stream somewhere else
+soundbridge listen --play 2:speaker=ID --play speaker            # the second stream on a device of its own
 soundbridge connect HOST --send mic --send system --denoise      # two streams; the mic voice only
 soundbridge connect HOST --send mic --denoise=whole              # voice only, keeping the start of every word
 soundbridge listen --play null                 # link test without sound:
@@ -44,6 +46,32 @@ soundbridge connect HOST --send tone --play none
 
 `soundbridge help listen` lists the tuning options (`--buffer`, `--packet`,
 `--period`, ...).
+
+### One stream somewhere else
+
+Streams are numbered from 1 in the order the sending end lists its sources:
+the order of `--send` on the command line and of the list in the desktop
+app; on a phone the microphone comes before phone audio. The receiving end
+can give any of them a place of its own ("Play one stream somewhere else" in
+the desktop app, `--play N:SINK` on the command line), which is how two
+microphones from the same machine end up on different devices:
+
+```sh
+soundbridge connect HOST --send mic=HEADSET --send mic=WEBCAM --send system
+soundbridge listen --play 1:virtual-mic --play 2:speaker=ID --play speaker
+```
+
+- A stream that is given a place plays only there, not where its kind goes
+  as well. Above, the third stream is the only one on the default speakers.
+- Given two places, it plays in both.
+- `--play N:none` ("Nothing" in the app) plays it nowhere, while the rest
+  carry on.
+- The number is a position, not a name: when the sending end removes a
+  source, the ones after it move up.
+
+The desktop app shows the number next to each source it sends and each stream
+it receives, and the command line in front of each stream once there are
+several (`recv 2:mic`). The Android app plays everything in one place.
 
 ### Voice only
 
@@ -96,8 +124,11 @@ Nothing is asked or shown beyond a line saying it happened.
 
 To turn that off, set "Updates" to Off in the desktop app or run
 `soundbridge update --auto off`; the switch is shared by both programs.
-`soundbridge update` installs the latest release on the spot, whatever the
-switch says.
+
+Whatever the switch says, a release can be looked for at any time: "Check
+now" in the desktop app says whether there is a newer one and offers to
+install it, `soundbridge update --check` only says so, and `soundbridge
+update` installs it on the spot.
 
 - An update is only as trustworthy as the HTTPS connection to GitHub:
   releases are not signed.

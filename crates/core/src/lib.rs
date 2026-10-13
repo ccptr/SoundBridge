@@ -32,7 +32,7 @@ pub use audio::{
 };
 pub use engine::{
     BufferMode, Config, Engine, Event, Peer, RxStats, SinkConfig, SourceConfig, State, Stats,
-    TxStats,
+    Streams, TxStats,
 };
 pub use protocol::{DEFAULT_PORT, Report};
 
