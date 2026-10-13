@@ -1,7 +1,7 @@
 # Maintainer: ccptr <cccptr@protonmail.com>
 
 pkgname=soundbridge-bin
-pkgver=0.3.0
+pkgver=0.4.0
 pkgrel=1
 pkgdesc="Low-latency audio link between a phone and a PC: command-line tool and desktop app (release binaries)"
 arch=('x86_64')
@@ -31,7 +31,7 @@ source=(
   "soundbridge-$pkgver.desktop::$_raw/soundbridge.desktop"
   "soundbridge-$pkgver.svg::$_raw/soundbridge.svg"
 )
-sha256sums=('3ba0788e0f444e2d14b2be8853affd4a84dbff7376e8ee54967b13ddf4fe1011'
+sha256sums=('3969dfb679b2fb6cb74595c0b303e4001692bc6a16f1a22ab83bef75392f9de4'
             'f644d9d50405be84732381ba5b335ca5691a366670b02f844540b8f7258d78d5'
             '87c1e9c13b83b389cf8b9efbf1e30ff81548b97cf9fd5076c449a889c3d582d6')
 
