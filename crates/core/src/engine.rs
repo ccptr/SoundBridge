@@ -716,6 +716,9 @@ impl Worker {
                                 .unwrap_or_else(|| TxSlot::pending(now))
                         })
                         .collect();
+                    // What still fails under the new settings is said again.
+                    session.tx.iter_mut().for_each(|tx| tx.last_error = None);
+                    session.rx.iter_mut().for_each(|rx| rx.last_error = None);
                     if old.send != self.config.send {
                         self.advertise();
                     }

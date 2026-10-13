@@ -356,6 +356,9 @@ impl Bridge {
     fn settings_changed(&mut self, cx: &mut Context<Self>) {
         self.settings.save();
         if let Some(engine) = &self.engine {
+            // A failure was of the settings as they were: the engine reports
+            // whatever fails with these.
+            self.notice.take_if(|notice| notice.error);
             engine.configure(config(&self.settings, &self.devices));
         }
         cx.notify();

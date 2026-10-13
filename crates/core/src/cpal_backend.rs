@@ -65,6 +65,19 @@ fn find_device(host: &cpal::Host, id: &str) -> Result<cpal::Device, String> {
     host.device_by_id(&parsed).ok_or_else(|| format!("device '{id}' is not available"))
 }
 
+/// The default output as a device to capture from. PipeWire's default output
+/// only plays; what it plays is captured from the "sink_default" beside it.
+fn default_playing(host: &cpal::Host) -> Option<cpal::Device> {
+    let default = host.default_output_device();
+    if default.as_ref().is_some_and(|device| device.supports_input()) {
+        return default;
+    }
+    let capturable = |device: &cpal::Device| {
+        device.supports_input() && device.id().is_ok_and(|id| id.id().ends_with("sink_default"))
+    };
+    host.devices().ok().and_then(|mut devices| devices.find(capturable)).or(default)
+}
+
 /// Ranks how well a supported range fits what we want; lower is better.
 fn score(range: &SupportedStreamConfigRange, rate: u32, channels: u16) -> Option<u32> {
     let format = match range.sample_format() {
@@ -217,9 +230,7 @@ impl AudioBackend for CpalBackend {
         let host = host();
         let device = match (&request.device, request.kind) {
             (Some(id), _) => find_device(&host, id)?,
-            (None, SourceKind::System) => {
-                host.default_output_device().ok_or("no default output device to capture")?
-            }
+            (None, SourceKind::System) => default_playing(&host).ok_or("no default output device to capture")?,
             (None, _) => host.default_input_device().ok_or("no default input device")?,
         };
         if !device.supports_input() {
