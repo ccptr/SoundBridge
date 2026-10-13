@@ -87,8 +87,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # These programs are not installed by a package manager, so they
+      # keep themselves current.
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --features self-update
 
       - name: Attach to the release
         run: |
@@ -126,8 +128,10 @@ jobs:
           test -n "$fxc"
           echo "GPUI_FXC_PATH=$(cygpath -w "$fxc")" >> "$GITHUB_ENV"
 
+      # These programs are not installed by a package manager, so they
+      # keep themselves current.
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --features self-update
 
       - name: Attach to the release
         run: |

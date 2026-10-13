@@ -43,6 +43,8 @@ const GAIN_CHOICES: [(i32, &str); 6] =
     [(-12, "-12 dB"), (-6, "-6 dB"), (0, "0 dB"), (6, "+6 dB"), (12, "+12 dB"), (24, "+24 dB")];
 const BUFFER_CHOICES: [(Option<u32>, &str); 5] =
     [(None, "Auto"), (Some(5), "5 ms"), (Some(10), "10 ms"), (Some(20), "20 ms"), (Some(40), "40 ms")];
+#[cfg(feature = "self-update")]
+const UPDATE_CHOICES: [(bool, &str); 2] = [(true, "Automatic"), (false, "Off")];
 
 /// The device list that is open, if any: for one of the sources, or for
 /// where one kind of received stream is played.
@@ -71,6 +73,15 @@ struct Bridge {
     devices: Vec<DeviceInfo>,
     open_picker: Option<Picker>,
     host: Entity<TextInput>,
+    /// False for a copy that something else keeps current.
+    #[cfg(feature = "self-update")]
+    self_updating: bool,
+    /// Whether new releases install themselves.
+    #[cfg(feature = "self-update")]
+    auto_update: bool,
+    /// The release installed while the app was running, which it is not yet.
+    #[cfg(feature = "self-update")]
+    updated: Option<soundbridge_update::Version>,
 }
 
 impl Bridge {
@@ -97,6 +108,22 @@ impl Bridge {
             }
         })
         .detach();
+        #[cfg(feature = "self-update")]
+        {
+            let (tx, rx) = async_channel::bounded(1);
+            soundbridge_update::auto(move |version| {
+                let _ = tx.send_blocking(version);
+            });
+            cx.spawn(async move |this, cx| {
+                if let Ok(version) = rx.recv().await {
+                    let _ = this.update(cx, |this, cx| {
+                        this.updated = Some(version);
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+        }
         // Hang up properly on quit so the peer is not left to time out.
         cx.on_app_quit(|this, _| {
             this.engine = None;
@@ -123,6 +150,12 @@ impl Bridge {
             devices: Vec::new(),
             open_picker: None,
             host,
+            #[cfg(feature = "self-update")]
+            self_updating: soundbridge_update::available(),
+            #[cfg(feature = "self-update")]
+            auto_update: soundbridge_update::auto_enabled(),
+            #[cfg(feature = "self-update")]
+            updated: None,
         };
         this.refresh_devices(cx);
         this
@@ -702,6 +735,21 @@ impl Bridge {
             .child(detail(hint))
     }
 
+    #[cfg(feature = "self-update")]
+    fn updates_section(&self, cx: &mut Context<Self>) -> Div {
+        let pick = cx.listener(|this, &auto: &bool, _, cx| {
+            this.auto_update = auto;
+            soundbridge_update::set_auto_enabled(auto);
+            cx.notify();
+        });
+        let hint: SharedString = match (self.updated, self.auto_update) {
+            (Some(version), _) => format!("Updated to {version}. Restart SoundBridge to use it.").into(),
+            (None, true) => "New releases are looked for once a day and installed for the next start.".into(),
+            (None, false) => format!("Stays at {} until this is turned back on.", env!("CARGO_PKG_VERSION")).into(),
+        };
+        section("UPDATES").child(segmented("updates", &UPDATE_CHOICES, self.auto_update, pick)).child(detail(hint))
+    }
+
     fn peers_section(&self, cx: &mut Context<Self>) -> Div {
         let mut section = section("DEVICES ON THIS NETWORK");
         if self.peers.is_empty() {
@@ -851,6 +899,10 @@ impl Render for Bridge {
             .child(self.play_section(Kind::Mic, cx))
             .child(self.play_section(Kind::System, cx))
             .child(self.buffer_section(cx));
+        #[cfg(feature = "self-update")]
+        if self.self_updating {
+            column = column.child(self.updates_section(cx));
+        }
         div()
             .size_full()
             .bg(rgb(theme::BACKGROUND))

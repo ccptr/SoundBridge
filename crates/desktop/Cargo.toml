@@ -10,8 +10,14 @@ license.workspace = true
 name = "soundbridge-desktop"
 path = "src/main.rs"
 
+[features]
+# For the programs released as plain binaries: they keep themselves current.
+# A build that a package manager installs is updated by it instead.
+self-update = ["dep:soundbridge-update"]
+
 [dependencies]
 soundbridge-core = { workspace = true, features = ["cpal"] }
+soundbridge-update = { workspace = true, optional = true }
 gpui = "0.2.2"
 async-channel = "2"
 unicode-segmentation = "1"

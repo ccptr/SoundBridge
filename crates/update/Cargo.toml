@@ -1,0 +1,17 @@
+[package]
+name = "soundbridge-update"
+description = "Self-update for the SoundBridge programs released as plain binaries"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+
+[target."cfg(not(windows))".dependencies]
+flate2 = "1.1.10"
+tar = { version = "0.4.46", default-features = false }
+
+[target."cfg(windows)".dependencies]
+zip = { version = "9.0.2", default-features = false, features = ["deflate"] }

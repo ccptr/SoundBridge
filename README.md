@@ -86,6 +86,29 @@ quieter, or is the whole gain when the automatic one is off. With either, a
 limiter keeps the stream from clipping. It runs on the sending end, before
 the audio is reduced to 16 bits, and adds no delay.
 
+### Updates
+
+The programs in a release's Linux and Windows archives keep themselves
+current. Once a day, when the desktop app starts or `soundbridge listen` or
+`connect` runs, they ask GitHub for the latest release, and if there is a
+newer one they replace both programs where they are; the next start runs it.
+Nothing is asked or shown beyond a line saying it happened.
+
+To turn that off, set "Updates" to Off in the desktop app or run
+`soundbridge update --auto off`; the switch is shared by both programs.
+`soundbridge update` installs the latest release on the spot, whatever the
+switch says.
+
+- An update is only as trustworthy as the HTTPS connection to GitHub:
+  releases are not signed.
+- The other end is not updated with it. When a release changes the protocol
+  version, an updated PC stops connecting to a phone still on the old app
+  until that is updated too.
+- Programs built from source or installed as a package do not have any of
+  this; see the `self-update` feature under Building. A package made from
+  the released binaries turns it off by starting them with
+  `SOUNDBRIDGE_NO_UPDATE` set, which leaves no switch to turn it back on.
+
 ## Building
 
 ```sh
@@ -98,6 +121,9 @@ cd android && ./gradlew assembleDebug
 - The Android build compiles `crates/android` with cargo for each ABI; it
   needs the NDK (27.2) and the Rust targets
   `aarch64-linux-android armv7-linux-androideabi`.
+- `--features self-update` builds in the updater described above, as the
+  release workflow does for the archives. Leave it out of anything a package
+  manager installs.
 - `Cargo.lock` pins `libc` to 0.2.186: a dependency of gpui 0.2.2 (`xattr`
   0.2.3) does not compile against later releases.
 
@@ -144,6 +170,7 @@ of milliseconds of its own.
 
 ```
 crates/core      protocol, packetizer, noise filter, jitter buffer, session engine, cpal backend
+crates/update    self-update for the released binaries
 crates/cli       soundbridge
 crates/desktop   soundbridge-desktop
 crates/android   JNI library: AAudio backend + engine bindings

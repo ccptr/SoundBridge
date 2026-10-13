@@ -10,7 +10,13 @@ license.workspace = true
 name = "soundbridge"
 path = "src/main.rs"
 
+[features]
+# For the programs released as plain binaries: they keep themselves current.
+# A build that a package manager installs is updated by it instead.
+self-update = ["dep:soundbridge-update"]
+
 [dependencies]
 soundbridge-core = { workspace = true, features = ["cpal"] }
+soundbridge-update = { workspace = true, optional = true }
 clap = { version = "4.6", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }

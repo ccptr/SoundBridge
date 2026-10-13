@@ -36,7 +36,16 @@ sha256sums=('82e7259753f859d7e812b51bcaac3bd61264a8902d5155588d94a72e26243ea4'
             '87c1e9c13b83b389cf8b9efbf1e30ff81548b97cf9fd5076c449a889c3d582d6')
 
 package() {
-  install -Dm755 -t "$pkgdir/usr/bin" "$_dir/soundbridge" "$_dir/soundbridge-desktop"
+  # The released programs update themselves unless they are started with
+  # this variable set; here pacman does that.
+  install -Dm755 -t "$pkgdir/usr/lib/soundbridge" "$_dir/soundbridge" "$_dir/soundbridge-desktop"
+  install -d "$pkgdir/usr/bin"
+  local program
+  for program in soundbridge soundbridge-desktop; do
+    printf '#!/bin/sh\nSOUNDBRIDGE_NO_UPDATE=1 exec /usr/lib/soundbridge/%s "$@"\n' "$program" \
+      > "$pkgdir/usr/bin/$program"
+    chmod 755 "$pkgdir/usr/bin/$program"
+  done
   install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname" "$_dir/README.md"
   install -Dm644 "soundbridge-$pkgver.desktop" "$pkgdir/usr/share/applications/soundbridge.desktop"
   install -Dm644 "soundbridge-$pkgver.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/soundbridge.svg"

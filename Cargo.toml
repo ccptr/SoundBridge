@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cli", "crates/desktop", "crates/android"]
-default-members = ["crates/core", "crates/cli", "crates/desktop"]
+members = ["crates/core", "crates/update", "crates/cli", "crates/desktop", "crates/android"]
+default-members = ["crates/core", "crates/update", "crates/cli", "crates/desktop"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ license = "GPL-2.0-or-later"
 
 [workspace.dependencies]
 soundbridge-core = { path = "crates/core" }
+soundbridge-update = { path = "crates/update" }
 
 [profile.release]
 lto = "thin"

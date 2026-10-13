@@ -85,6 +85,25 @@ enum Command {
     },
     /// List audio devices and their ids
     Devices,
+    /// Update to the latest release, or turn automatic updates on or off
+    ///
+    /// Left alone, `listen` and `connect` look for a new release once a day
+    /// and install it in the background, for the next start.
+    #[cfg(feature = "self-update")]
+    Update {
+        /// Whether updates install themselves from now on, instead of updating now
+        #[arg(long, value_name = "on|off", value_parser = parse_switch)]
+        auto: Option<bool>,
+    },
+}
+
+#[cfg(feature = "self-update")]
+fn parse_switch(s: &str) -> Result<bool, String> {
+    match s {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err("expected on or off".into()),
+    }
 }
 
 /// One `--send`: a kind of source, and optionally which device.
@@ -330,7 +349,10 @@ fn resolve(peer: &str) -> Result<SocketAddr, String> {
 }
 
 fn main() -> ExitCode {
-    let result = match Cli::parse().command {
+    let command = Cli::parse().command;
+    #[cfg(feature = "self-update")]
+    let updated = matches!(command, Command::Listen { .. } | Command::Connect { .. }).then(auto_update);
+    let result = match command {
         Command::Listen { port, once, link } => run_link(link.config(port, true), None, once, link.quiet),
         Command::Connect { peer, link } => match resolve(&peer) {
             // Any free local port: the dialer does not need to be findable.
@@ -342,7 +364,14 @@ fn main() -> ExitCode {
             devices();
             Ok(())
         }
+        #[cfg(feature = "self-update")]
+        Command::Update { auto } => update(auto),
     };
+    // Said on the way out, where it cannot land in the statistics line.
+    #[cfg(feature = "self-update")]
+    if let Some(Ok(version)) = updated.map(|updated| updated.try_recv()) {
+        eprintln!("soundbridge: updated to {version}, which the next start runs");
+    }
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -350,6 +379,34 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Starts the daily look for a new release; the version arrives if one was
+/// installed while this run lasted.
+#[cfg(feature = "self-update")]
+fn auto_update() -> mpsc::Receiver<soundbridge_update::Version> {
+    let (tx, rx) = mpsc::channel();
+    soundbridge_update::auto(move |version| {
+        let _ = tx.send(version);
+    });
+    rx
+}
+
+#[cfg(feature = "self-update")]
+fn update(auto: Option<bool>) -> Result<(), String> {
+    use soundbridge_update::Outcome;
+    if let Some(auto) = auto {
+        soundbridge_update::set_auto_enabled(auto);
+    }
+    match auto {
+        Some(true) => println!("Updates install themselves, looked for once a day"),
+        Some(false) => println!("Updates are installed only by `soundbridge update`"),
+        None => match soundbridge_update::update()? {
+            Outcome::Current(version) => println!("{version} is the latest release"),
+            Outcome::Updated(version) => println!("Updated to {version}"),
+        },
+    }
+    Ok(())
 }
 
 fn devices() {
