@@ -34,8 +34,9 @@ Examples:
   Use a phone as this PC's microphone (the phone connects and sends its mic):
     soundbridge listen --play virtual-mic
 
-  The same, while also hearing what the phone is playing:
-    soundbridge listen --play mic:virtual-mic --play system:speaker
+  The same, while also hearing what the phone is playing (it sends its
+  microphone first, so that is stream 1):
+    soundbridge listen --play 1:virtual-mic --play speaker
 
   Send two microphones, and at the other end play the second on a device of
   its own and the rest on the default one:
@@ -166,8 +167,7 @@ impl Remote {
 fn parse_remote(s: &str) -> Result<Remote, String> {
     let (slot, setting) = match s.split_once(':') {
         Some((number, setting)) if number.starts_with(|c: char| c.is_ascii_digit()) => {
-            let Streams::Slot(slot) = parse_streams(number)? else { unreachable!("a number is a slot") };
-            (Some(slot), setting)
+            (Some(parse_slot(number)?), setting)
         }
         _ => (None, s),
     };
@@ -208,7 +208,7 @@ fn parse_source(s: &str) -> Result<Source, String> {
 fn parse_sink(s: &str) -> Result<Sink, String> {
     let (what, device) = split_device(s);
     let (from, sink) = match what.split_once(':') {
-        Some((from, sink)) => (parse_streams(from)?, sink),
+        Some((number, sink)) => (Streams::Slot(parse_slot(number)?), sink),
         None => (Streams::All, what),
     };
     let kind = match sink {
@@ -221,14 +221,11 @@ fn parse_sink(s: &str) -> Result<Sink, String> {
     Ok(Sink { from, kind, device })
 }
 
-/// The part of a `--play` before the colon: a kind of source, or the number
-/// of one of the peer's streams, counted from 1.
-fn parse_streams(s: &str) -> Result<Streams, String> {
-    if !s.starts_with(|c: char| c.is_ascii_digit()) {
-        return parse_kind(s).map(Streams::Kind);
-    }
+/// The part of a `--play` before the colon: the number of one of the peer's
+/// streams, counted from 1.
+fn parse_slot(s: &str) -> Result<u8, String> {
     match s.parse::<usize>() {
-        Ok(number) if (1..=MAX_STREAMS).contains(&number) => Ok(Streams::Slot(number as u8 - 1)),
+        Ok(number) if (1..=MAX_STREAMS).contains(&number) => Ok(number as u8 - 1),
         _ => Err(format!("'{s}' is not a stream: they are numbered 1 to {MAX_STREAMS}")),
     }
 }
@@ -283,12 +280,12 @@ struct LinkArgs {
     /// What to do with audio received from the peer: `speaker` (an output
     /// device), `virtual-mic` (a microphone other applications can record
     /// from; PipeWire), `null` (receive and measure, play nothing) or `none`
-    /// (ignore it). Add `=ID` to pick the device. Prefix `mic:` or `system:`
-    /// to play only that kind of stream there, and repeat to send each kind
-    /// somewhere else. Prefix a number to play one stream there, the peer's
-    /// first --send being `1:`; that stream then plays nowhere else, and
-    /// with `none` nowhere at all
-    #[arg(short, long, value_name = "[KIND|N:]SINK[=ID]", default_value = "speaker", value_parser = parse_sink)]
+    /// (ignore it). Add `=ID` to pick the device. Prefix a number to play
+    /// one stream there, the peer's first --send being `1:`; that stream
+    /// then plays nowhere else, and with `none` nowhere at all. Repeat to
+    /// give each stream a place; without a number it is where the streams
+    /// that have none go
+    #[arg(short, long, value_name = "[N:]SINK[=ID]", default_value = "speaker", value_parser = parse_sink)]
     play: Vec<Sink>,
 
     /// Set how the peer filters and levels the microphones it sends, as if
@@ -783,16 +780,16 @@ mod tests {
         assert!(parse_source("system").unwrap().device.is_none());
         assert!(parse_source("loud").is_err());
 
-        let sink = parse_sink("mic:virtual-mic").unwrap();
-        assert_eq!((sink.from, sink.kind), (Streams::Kind(SourceKind::Mic), Some(SinkKind::VirtualMic)));
         let sink = parse_sink("speaker=wasapi:{0.0}").unwrap();
         assert_eq!(
             (sink.from, sink.kind, sink.device.as_deref()),
             (Streams::All, Some(SinkKind::Speaker), Some("wasapi:{0.0}"))
         );
         assert!(parse_sink("none").unwrap().kind.is_none());
-        assert!(parse_sink("mic:loud").is_err());
+        assert!(parse_sink("1:loud").is_err());
         assert!(parse_sink("loud:speaker").is_err());
+        // Streams are no longer picked by what they carry.
+        assert!(parse_sink("mic:virtual-mic").is_err());
 
         // Streams are counted from 1 on the command line, slots from 0.
         let sink = parse_sink("2:speaker=pipewire:out:1").unwrap();
@@ -808,7 +805,7 @@ mod tests {
     #[test]
     fn one_stream_somewhere_else_or_nowhere() {
         let cli = Cli::try_parse_from([
-            "soundbridge", "listen", "--play", "1:virtual-mic", "--play", "3:none", "--play", "mic:none", "--play",
+            "soundbridge", "listen", "--play", "1:virtual-mic", "--play", "3:none", "--play", "none", "--play",
             "speaker",
         ])
         .unwrap();
@@ -839,8 +836,8 @@ mod tests {
     #[test]
     fn several_streams_each_way() {
         let cli = Cli::try_parse_from([
-            "soundbridge", "listen", "--denoise", "--send", "mic", "--send", "system", "--play", "mic:virtual-mic",
-            "--play", "system:speaker", "--play", "none",
+            "soundbridge", "listen", "--denoise", "--send", "mic", "--send", "system", "--play", "1:virtual-mic",
+            "--play", "2:speaker", "--play", "none",
         ])
         .unwrap();
         let Command::Listen { link, .. } = cli.command else { panic!() };
@@ -851,8 +848,8 @@ mod tests {
         assert_eq!(
             played,
             [
-                (Streams::Kind(SourceKind::Mic), SinkKind::VirtualMic),
-                (Streams::Kind(SourceKind::System), SinkKind::Speaker)
+                (Streams::Slot(0), SinkKind::VirtualMic),
+                (Streams::Slot(1), SinkKind::Speaker)
             ]
         );
 

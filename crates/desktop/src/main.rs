@@ -48,13 +48,15 @@ const THUMB_REACH: f32 = 7.;
 #[cfg(feature = "self-update")]
 const UPDATE_CHOICES: [(bool, &str); 2] = [(true, "Automatic"), (false, "Off")];
 
-/// The device list that is open, if any: for one of the sources, for where
-/// one kind of received stream is played, or for where one stream is.
+/// The device list that is open, if any: for one of the sources, or for
+/// where one received stream is played. That stream is one of those listed
+/// in the settings, by its place there, or one the other device sends that
+/// is not listed yet, by its slot.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Picker {
     Source(usize),
-    Sink(Kind),
     Stream(usize),
+    Unlisted(u8),
 }
 
 /// Whose microphone a set of controls is for: one this PC sends, by its place
@@ -516,8 +518,12 @@ impl Bridge {
     fn picked_device(&mut self, picker: Picker) -> Option<&mut Option<String>> {
         match picker {
             Picker::Source(index) => self.settings.sources.get_mut(index).map(|s| &mut s.device),
-            Picker::Sink(kind) => Some(&mut self.route_mut(kind).device),
             Picker::Stream(index) => self.settings.play_streams.get_mut(index).map(|s| &mut s.route.device),
+            // Choosing a device for it is what lists it.
+            Picker::Unlisted(slot) => {
+                self.settings.play_streams.push(StreamRoute { slot, route: Route::default() });
+                self.settings.play_streams.last_mut().map(|s| &mut s.route.device)
+            }
         }
     }
 
@@ -561,20 +567,6 @@ impl Bridge {
             });
         })
         .detach();
-    }
-
-    fn route(&self, kind: Kind) -> &Route {
-        match kind {
-            Kind::Mic => &self.settings.play_mic,
-            Kind::System => &self.settings.play_system,
-        }
-    }
-
-    fn route_mut(&mut self, kind: Kind) -> &mut Route {
-        match kind {
-            Kind::Mic => &mut self.settings.play_mic,
-            Kind::System => &mut self.settings.play_system,
-        }
     }
 
     fn device_name(&self, id: &Option<String>, direction: DeviceDirection) -> SharedString {
@@ -638,22 +630,13 @@ fn sinks(settings: &Settings) -> Vec<SinkConfig> {
             Play::VirtualMic => SinkConfig { kind: SinkKind::VirtualMic, device: None, from },
         })
     };
-    // A stream with a place of its own, even if that is nowhere, is kept
-    // from where its kind goes.
+    // A stream that is listed, even to play nowhere, is kept from where
+    // the ones that are not listed go.
     let streams = settings.play_streams.iter().map(|stream| {
         let from = Streams::Slot(stream.slot);
         sink(&stream.route, from).unwrap_or(SinkConfig { from, ..SinkConfig::new(SinkKind::Nothing) })
     });
-    let (mic, system) = (
-        sink(&settings.play_mic, Streams::Kind(SourceKind::Mic)),
-        sink(&settings.play_system, Streams::Kind(SourceKind::System)),
-    );
-    // Both kinds going to one place means everything does, test tones included.
-    let same = sink(&settings.play_mic, Streams::All);
-    if same.is_some() && same == sink(&settings.play_system, Streams::All) {
-        return streams.chain(same).collect();
-    }
-    streams.chain(mic).chain(system).collect()
+    streams.chain(sink(&Route::default(), Streams::All)).collect()
 }
 
 fn kind_name(kind: SourceKind) -> &'static str {
@@ -895,9 +878,8 @@ impl Bridge {
         let open = self.open_picker == Some(picker);
         let id: ElementId = match picker {
             Picker::Source(index) => ("source-device", index).into(),
-            Picker::Sink(Kind::Mic) => "mic-sink-device".into(),
-            Picker::Sink(Kind::System) => "system-sink-device".into(),
             Picker::Stream(index) => ("stream-sink-device", index).into(),
+            Picker::Unlisted(slot) => ("unlisted-sink-device", slot as usize).into(),
         };
         let header = div()
             .id(id)
@@ -1116,70 +1098,55 @@ impl Bridge {
         Some(section)
     }
 
-    /// Where one kind of stream from the other device is played.
-    fn play_section(&self, kind: Kind, cx: &mut Context<Self>) -> Div {
-        let (title, id) = match kind {
-            Kind::Mic => ("PLAY THE OTHER DEVICE'S MICROPHONE", "play-mic"),
-            Kind::System => ("PLAY WHAT THE OTHER DEVICE IS PLAYING", "play-system"),
-        };
+    /// Where each of the other device's streams is played, by number: the
+    /// ones listed in the settings, then the ones it sends that are not.
+    fn streams_section(&self, cx: &mut Context<Self>) -> Div {
         let mut options = vec![(Play::Off, "Nothing"), (Play::Speaker, "Speakers")];
         // Only PipeWire lets us create the device ourselves.
         if cfg!(target_os = "linux") {
             options.push((Play::VirtualMic, "Virtual mic"));
         }
-        let route = self.route(kind);
-        let pick = cx.listener(move |this, &play: &Play, _, cx| {
-            this.route_mut(kind).play = play;
-            this.open_picker = None;
-            this.settings_changed(cx);
-        });
-        let section = section(title).child(segmented(id, &options, route.play, pick));
-        match route.play {
-            Play::Off => section,
-            Play::Speaker => {
-                section.child(self.device_picker(Picker::Sink(kind), &route.device, DeviceDirection::Output, cx))
-            }
-            Play::VirtualMic => section.child(detail(
-                "Appears to other apps as the input device \"SoundBridge Microphone\" while connected.",
-            )),
-        }
-    }
-
-    /// The streams that are played somewhere of their own, by number.
-    fn streams_section(&self, cx: &mut Context<Self>) -> Div {
-        let mut options = vec![(Play::Off, "Nothing"), (Play::Speaker, "Speakers")];
-        if cfg!(target_os = "linux") {
-            options.push((Play::VirtualMic, "Virtual mic"));
-        }
-        let mut section = section("PLAY ONE STREAM SOMEWHERE ELSE").child(detail(
-            "Streams are numbered in the order the other device sends them. One that is listed here \
-             plays where this says and not where its kind does; listed twice, in both places.",
+        let mut section = section("PLAY WHAT THE OTHER DEVICE SENDS").child(detail(
+            "Each stream has a place of its own. They are numbered in the order the other device \
+             sends them. One that is not listed plays on the default speakers; listed twice, in both places.",
         ));
+        // What the other device says it sends, or for one too old to say,
+        // what is arriving from it.
+        let sent = (self.stats.remote_sources.iter().map(|source| (source.slot, source.kind)))
+            .chain(self.stats.rx.iter().map(|rx| (rx.slot, rx.kind)));
+        let title = |slot: u8| match sent.clone().find(|&(sent, _)| sent == slot) {
+            Some((_, kind)) => format!("Stream {} · {}", slot + 1, kind_name(kind)),
+            None => format!("Stream {}", slot + 1),
+        };
+        let link = |id: &'static str, index: usize, label: &'static str| {
+            div()
+                .id((id, index))
+                .text_size(px(12.))
+                .text_color(rgb(theme::MUTED))
+                .hover(|s| s.text_color(rgb(theme::TEXT)))
+                .cursor_pointer()
+                .child(label)
+        };
+        let block = |heading: Div, choices: Stateful<Div>| div().flex().flex_col().gap_1().child(heading).child(choices);
+        let virtual_mic =
+            || detail("Appears to other apps as the input device \"SoundBridge Microphone\" while connected.");
         for (index, stream) in self.settings.play_streams.iter().enumerate() {
-            let link = |id: &'static str, label: &'static str| {
-                div()
-                    .id((id, index))
-                    .text_size(px(12.))
-                    .text_color(rgb(theme::MUTED))
-                    .hover(|s| s.text_color(rgb(theme::TEXT)))
-                    .cursor_pointer()
-                    .child(label)
-            };
             let renumber = |id, label, by: i32, cx: &mut Context<Self>| {
-                link(id, label).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                link(id, index, label).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     if let Some(stream) = this.settings.play_streams.get_mut(index) {
                         stream.slot = (stream.slot as i32 + by).clamp(0, MAX_STREAMS as i32 - 1) as u8;
                     }
                     this.settings_changed(cx);
                 }))
             };
-            let remove = link("remove-stream", "Remove").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                if index < this.settings.play_streams.len() {
-                    this.settings.play_streams.remove(index);
-                }
-                this.open_picker = None;
-                this.settings_changed(cx);
-            }));
+            let remove =
+                link("remove-stream", index, "Remove").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    if index < this.settings.play_streams.len() {
+                        this.settings.play_streams.remove(index);
+                    }
+                    this.open_picker = None;
+                    this.settings_changed(cx);
+                }));
             let pick = cx.listener(move |this, &play: &Play, _, cx| {
                 if let Some(stream) = this.settings.play_streams.get_mut(index) {
                     stream.route.play = play;
@@ -1187,34 +1154,51 @@ impl Bridge {
                 this.open_picker = None;
                 this.settings_changed(cx);
             });
-            let block = div()
+            let heading = div()
                 .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .child(div().flex_1().text_size(px(13.)).child(format!("Stream {}", stream.slot + 1)))
-                        .child(renumber("stream-earlier", "Earlier", -1, cx))
-                        .child(renumber("stream-later", "Later", 1, cx))
-                        .child(remove),
-                )
-                .child(segmented(("play-stream", index), &options, stream.route.play, pick));
+                .items_center()
+                .gap_3()
+                .child(div().flex_1().text_size(px(13.)).child(title(stream.slot)))
+                .child(renumber("stream-earlier", "Earlier", -1, cx))
+                .child(renumber("stream-later", "Later", 1, cx))
+                .child(remove);
+            let block = block(heading, segmented(("play-stream", index), &options, stream.route.play, pick));
             section = section.child(match stream.route.play {
+                Play::Off => block,
                 Play::Speaker => block.child(self.device_picker(
                     Picker::Stream(index),
                     &stream.route.device,
                     DeviceDirection::Output,
                     cx,
                 )),
-                _ => block,
+                Play::VirtualMic => block.child(virtual_mic()),
             });
+        }
+        // The rest of what is being sent, where it plays for not being
+        // listed. Setting one of these lists it.
+        let listed = |slot: u8| self.settings.play_streams.iter().any(|stream| stream.slot == slot);
+        let mut unlisted: Vec<u8> = sent.clone().map(|(slot, _)| slot).filter(|&slot| !listed(slot)).collect();
+        unlisted.sort_unstable();
+        unlisted.dedup();
+        for slot in unlisted {
+            let pick = cx.listener(move |this, &play: &Play, _, cx| {
+                let route = Route { play, device: None };
+                this.settings.play_streams.push(StreamRoute { slot, route });
+                this.open_picker = None;
+                this.settings_changed(cx);
+            });
+            let heading = div().text_size(px(13.)).child(title(slot));
+            let choices = segmented(("play-unlisted", slot as usize), &options, Play::Speaker, pick);
+            section = section.child(block(heading, choices).child(self.device_picker(
+                Picker::Unlisted(slot),
+                &None,
+                DeviceDirection::Output,
+                cx,
+            )));
         }
         section.child(div().flex().child(button("add-stream", "Add a stream", false).on_click(cx.listener(
             |this, _: &ClickEvent, _, cx| {
-                // The first one that has no place of its own yet.
+                // The first one that is not listed yet.
                 let taken = |slot: &u8| this.settings.play_streams.iter().any(|s| s.slot == *slot);
                 let slot = (0..MAX_STREAMS as u8).find(|slot| !taken(slot)).unwrap_or(0);
                 this.settings.play_streams.push(StreamRoute { slot, route: Route::default() });
@@ -1374,11 +1358,7 @@ impl Bridge {
 
             // What we receive.
             if self.stats.rx.is_empty() {
-                let ignoring = sinks(&self.settings).iter().all(|sink| sink.kind == SinkKind::Nothing);
-                section = section.child(detail(match ignoring {
-                    true => "Ignoring incoming audio.",
-                    false => "The other device is not sending anything played here.",
-                }));
+                section = section.child(detail("The other device is not sending anything played here."));
             }
             for rx in &self.stats.rx {
                 let mut text = format!("Buffer {:.1} ms · jitter {:.1} ms", rx.buffer_ms, rx.jitter_ms);
@@ -1432,8 +1412,6 @@ impl Render for Bridge {
         }
         column = column
             .child(self.send_section(cx))
-            .child(self.play_section(Kind::Mic, cx))
-            .child(self.play_section(Kind::System, cx))
             .child(self.streams_section(cx))
             .child(self.buffer_section(cx));
         #[cfg(feature = "self-update")]

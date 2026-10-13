@@ -11,8 +11,7 @@
 //!
 //! Either list can be any length. Every source is its own stream, numbered
 //! by its place in the list (its slot). An arriving stream is played on the
-//! sinks that name its slot, or failing those on each sink that takes its
-//! kind.
+//! sinks that name its slot, or failing those on each sink that names none.
 //!
 //! How a microphone is filtered and levelled is a setting of the end that
 //! sends it, but it is the other end that hears the result. So each end
@@ -113,10 +112,9 @@ fn sanitized(settings: SourceSettings) -> SourceSettings {
 /// Which of the peer's streams a sink plays.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Streams {
+    /// Those that no sink names by slot.
     #[default]
     All,
-    /// Those of one kind.
-    Kind(SourceKind),
     /// The one the peer sends in this slot, whatever it carries. A stream
     /// that any sink names this way is played on such sinks only.
     Slot(u8),
@@ -136,11 +134,10 @@ impl SinkConfig {
 
     /// Whether the stream in `slot` is played here; `named` says that some
     /// sink asks for that slot.
-    fn takes(&self, slot: u8, kind: SourceKind, named: bool) -> bool {
+    fn takes(&self, slot: u8, named: bool) -> bool {
         self.kind != SinkKind::Nothing
             && match self.from {
                 Streams::Slot(wanted) => wanted == slot,
-                Streams::Kind(wanted) => !named && wanted == kind,
                 Streams::All => !named,
             }
     }
@@ -163,8 +160,8 @@ pub struct Config {
     /// [`MAX_STREAMS`](protocol::MAX_STREAMS) are used.
     pub send: Vec<SourceConfig>,
     /// Where received streams go. A stream is played on every sink that
-    /// names its slot, or with none that does on every sink that takes its
-    /// kind, and dropped if there is none of either.
+    /// names its slot, or with none that does on every sink that names no
+    /// slot, and dropped if there is none of either.
     pub play: Vec<SinkConfig>,
     /// Audio per packet. Smaller is lower latency and more packets.
     pub packet_ms: f32,
@@ -1019,7 +1016,7 @@ impl Worker {
         session.rx.retain(|rx| rx.slot != header.slot || rx.kind == header.kind);
         let named = self.config.play.iter().any(|sink| sink.from == Streams::Slot(header.slot));
         for (sink, config) in self.config.play.iter().enumerate() {
-            if !config.takes(header.slot, header.kind, named) {
+            if !config.takes(header.slot, named) {
                 continue;
             }
             let found = session.rx.iter().position(|rx| rx.slot == header.slot && rx.sink == sink);

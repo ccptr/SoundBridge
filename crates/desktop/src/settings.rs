@@ -35,7 +35,7 @@ pub enum Play {
     VirtualMic,
 }
 
-/// Where one kind of received stream goes.
+/// Where a received stream goes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Route {
     pub play: Play,
@@ -43,7 +43,7 @@ pub struct Route {
     pub device: Option<String>,
 }
 
-/// Where one of the other device's streams goes, instead of where its kind does.
+/// Where one of the other device's streams goes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StreamRoute {
     /// Which stream, counted from 0 in the order the other device sends them.
@@ -54,11 +54,8 @@ pub struct StreamRoute {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
     pub sources: Vec<Source>,
-    /// Microphones the other device sends.
-    pub play_mic: Route,
-    /// What the other device is playing.
-    pub play_system: Route,
-    /// Streams played somewhere of their own. One listed twice plays in both places.
+    /// Where the other device's streams are played. One listed twice plays
+    /// in both places, and one that is not listed on the default speakers.
     pub play_streams: Vec<StreamRoute>,
     /// Fixed jitter buffer in ms, or `None` for automatic.
     pub buffer_ms: Option<u32>,
@@ -127,10 +124,6 @@ impl Settings {
                     let device = fields.next().and_then(device);
                     s.sources.push(Source { kind, device, denoise, auto_gain, gain_db });
                 }
-                "play_mic" => s.play_mic.play = play(value),
-                "play_mic_device" => s.play_mic.device = device(value),
-                "play_system" => s.play_system.play = play(value),
-                "play_system_device" => s.play_system.device = device(value),
                 // number|play|device, the number counted from 1 as it is shown.
                 "play_stream" => {
                     let mut fields = value.splitn(3, '|');
@@ -173,11 +166,7 @@ impl Settings {
             out += &format!("play_stream={}|{}|{}\n", stream.slot as usize + 1, play(route.play), device(&route.device));
         }
         out + &format!(
-            "play_mic={}\nplay_mic_device={}\nplay_system={}\nplay_system_device={}\nbuffer_ms={}\nhost={}\n",
-            play(self.play_mic.play),
-            device(&self.play_mic.device),
-            play(self.play_system.play),
-            device(&self.play_system.device),
+            "buffer_ms={}\nhost={}\n",
             self.buffer_ms.map(|ms| ms.to_string()).unwrap_or_default(),
             self.host.replace('\n', " "),
         )
@@ -211,11 +200,10 @@ mod tests {
                     ..Source::default()
                 },
             ],
-            play_mic: Route { play: Play::VirtualMic, device: None },
-            play_system: Route { play: Play::Speaker, device: Some("wasapi:{0.0.0.00000000}.{a=b}".into()) },
             play_streams: vec![
                 StreamRoute { slot: 1, route: Route { play: Play::Speaker, device: Some("pipewire:a|b".into()) } },
                 StreamRoute { slot: 1, route: Route::default() },
+                StreamRoute { slot: 0, route: Route { play: Play::VirtualMic, device: None } },
                 StreamRoute { slot: 63, route: Route { play: Play::Off, device: None } },
             ],
             buffer_ms: Some(10),
@@ -246,9 +234,15 @@ mod tests {
 
     #[test]
     fn tolerates_junk() {
-        let junk = "nonsense\nsource=loud\nsend=mic\nbuffer_ms=soon\nplay_mic=off\nplay_stream=0|off|\nplay_stream=x\n";
-        let s = Settings::parse(junk);
-        let play_mic = Route { play: Play::Off, device: None };
-        assert_eq!(s, Settings { play_mic, ..Settings::default() });
+        let junk = "nonsense\nsource=loud\nsend=mic\nbuffer_ms=soon\nplay_stream=0|off|\nplay_stream=x\n";
+        assert_eq!(Settings::parse(junk), Settings::default());
+    }
+
+    #[test]
+    fn drops_where_each_kind_was_played() {
+        // From when streams were routed by what they carry, which says
+        // nothing about their numbers.
+        let s = Settings::parse("play_mic=virtual-mic\nplay_system=off\nplay_system_device=x\nhost=pc\n");
+        assert_eq!(s, Settings { host: "pc".into(), ..Settings::default() });
     }
 }

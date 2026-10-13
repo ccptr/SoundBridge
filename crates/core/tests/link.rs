@@ -142,13 +142,9 @@ fn tone_source(channels: u16) -> SourceConfig {
 }
 
 #[test]
-fn several_streams_one_way_each_go_where_their_kind_is_played() {
+fn several_streams_one_way_each_play_on_every_sink() {
     let (listener, listener_events) = engine(Config {
-        play: vec![
-            SinkConfig::new(SinkKind::Null),
-            SinkConfig { from: Streams::Kind(SourceKind::Tone), ..SinkConfig::new(SinkKind::Null) },
-            SinkConfig { from: Streams::Kind(SourceKind::Mic), ..SinkConfig::new(SinkKind::Null) },
-        ],
+        play: vec![SinkConfig::new(SinkKind::Null), SinkConfig::new(SinkKind::Null)],
         ..config("listener")
     });
     let (dialer, dialer_events) = engine(Config {
@@ -157,8 +153,7 @@ fn several_streams_one_way_each_go_where_their_kind_is_played() {
     });
     dialer.connect(local(&listener));
 
-    // Each of the three streams is played on the two sinks that take tones,
-    // and on neither twice.
+    // Each of the three streams is played on both sinks, and on neither twice.
     let mut rx = wait_for(&listener_events, "every stream to play", |e| match e {
         Event::Stats(Stats { rx, .. }) if rx.len() == 6 && rx.iter().all(|rx| rx.playing) => Some(rx),
         Event::Stats(Stats { rx, .. }) if rx.len() > 6 => panic!("{} outputs for 3 streams", rx.len()),
