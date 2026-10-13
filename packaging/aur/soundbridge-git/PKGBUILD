@@ -1,7 +1,7 @@
 # Maintainer: ccptr <cccptr@protonmail.com>
 
 pkgname=soundbridge-git
-pkgver=0.1.0.r0.g0000000
+pkgver=0.1.0.r8.g6f68075
 pkgrel=1
 pkgdesc="Low-latency audio link between a phone and a PC: command-line tool and desktop app"
 arch=('x86_64' 'aarch64')
@@ -55,7 +55,9 @@ check() {
   cd "$pkgname"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
-  cargo test --frozen --release
+  # Not the desktop app: its tests would build gpui a second time, since
+  # tests cannot share the panic=abort objects of the release build.
+  cargo test --frozen --release -p soundbridge-core -p soundbridge-cli
 }
 
 package() {

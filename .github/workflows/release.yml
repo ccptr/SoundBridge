@@ -1,8 +1,8 @@
 name: Release artifacts
 
-# Builds the Android APKs and the Linux and Windows binaries and attaches them
-# to a release when it is published. It can also be run by hand for an
-# existing release, to rebuild its files.
+# Builds the Android APKs, the Linux and Windows binaries and the Arch Linux
+# package and attaches them to a release when it is published. It can also be
+# run by hand for an existing release, to rebuild its files or one kind of them.
 on:
   release:
     types: [published]
@@ -11,6 +11,9 @@ on:
       tag:
         description: Tag of an existing release to build and attach files to
         required: true
+      only:
+        description: Build only this job (android, linux, windows or pacman); all of them if empty
+        required: false
 
 permissions:
   contents: write
@@ -22,6 +25,7 @@ env:
 
 jobs:
   android:
+    if: ${{ !inputs.only || inputs.only == 'android' }}
     name: Android APKs
     runs-on: ubuntu-24.04
     steps:
@@ -62,6 +66,7 @@ jobs:
             "SoundBridge-$TAG-debug.apk" "SoundBridge-$TAG-release-unsigned.apk"
 
   linux:
+    if: ${{ !inputs.only || inputs.only == 'linux' }}
     name: Linux binaries
     runs-on: ubuntu-24.04
     steps:
@@ -94,6 +99,7 @@ jobs:
           gh release upload "$TAG" --clobber "$dir.tar.gz"
 
   windows:
+    if: ${{ !inputs.only || inputs.only == 'windows' }}
     name: Windows binaries
     runs-on: windows-2025
     defaults:
@@ -130,3 +136,36 @@ jobs:
           cp target/release/soundbridge.exe target/release/soundbridge-desktop.exe LICENSE README.md "$dir"
           7z a "$dir.zip" "$dir"
           gh release upload "$TAG" --clobber "$dir.zip"
+
+  # Packages the binaries the linux job attached, instead of building them again.
+  pacman:
+    needs: linux
+    # Runs when the linux job was skipped (only: pacman), on what the release
+    # already has.
+    if: ${{ !failure() && !cancelled() && (!inputs.only || inputs.only == 'pacman') }}
+    name: Arch Linux package
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    steps:
+      - name: Install tools
+        run: pacman -Syu --noconfirm git github-cli
+
+      # The PKGBUILD of the commit the workflow runs from, which for a run by
+      # hand need not be the tag.
+      - uses: actions/checkout@v5
+
+      # makepkg refuses to run as root. The archive is already next to the
+      # PKGBUILD, so it is not downloaded again; its checksum in the PKGBUILD
+      # is that of an earlier build.
+      - name: Build
+        working-directory: packaging/aur/soundbridge-bin
+        run: |
+          gh release download "$TAG" --pattern "soundbridge-$TAG-linux-x86_64.tar.gz"
+          useradd -m build
+          chown -R build .
+          sed -i "s/^pkgver=.*/pkgver=${TAG#v}/" PKGBUILD
+          su build -c 'makepkg --nodeps --skipchecksums'
+
+      - name: Attach to the release
+        working-directory: packaging/aur/soundbridge-bin
+        run: gh release upload "$TAG" --clobber soundbridge-bin-"${TAG#v}"-*.pkg.tar.zst

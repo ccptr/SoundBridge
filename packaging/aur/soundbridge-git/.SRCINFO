@@ -1,0 +1,29 @@
+pkgbase = soundbridge-git
+	pkgdesc = Low-latency audio link between a phone and a PC: command-line tool and desktop app
+	pkgver = 0.1.0.r8.g6f68075
+	pkgrel = 1
+	url = https://github.com/ccptr/SoundBridge
+	arch = x86_64
+	arch = aarch64
+	license = GPL-2.0-or-later
+	makedepends = cargo
+	makedepends = clang
+	makedepends = git
+	depends = alsa-lib
+	depends = gcc-libs
+	depends = glibc
+	depends = libpipewire
+	depends = libxcb
+	depends = libxkbcommon
+	depends = libxkbcommon-x11
+	depends = vulkan-driver
+	depends = vulkan-icd-loader
+	depends = wayland
+	optdepends = pipewire-audio: pw-loopback, for the virtual microphone
+	provides = soundbridge=0.1.0
+	conflicts = soundbridge
+	options = !lto
+	source = soundbridge-git::git+https://github.com/ccptr/SoundBridge.git
+	sha256sums = SKIP
+
+pkgname = soundbridge-git

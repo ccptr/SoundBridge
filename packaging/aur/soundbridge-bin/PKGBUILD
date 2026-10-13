@@ -1,0 +1,43 @@
+# Maintainer: ccptr <cccptr@protonmail.com>
+
+pkgname=soundbridge-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Low-latency audio link between a phone and a PC: command-line tool and desktop app (release binaries)"
+arch=('x86_64')
+url="https://github.com/ccptr/SoundBridge"
+license=('GPL-2.0-or-later')
+depends=(
+  'alsa-lib'
+  'gcc-libs'
+  'glibc'
+  'libpipewire'
+  'libxcb'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'vulkan-driver'
+  'vulkan-icd-loader'
+  'wayland'
+)
+optdepends=('pipewire-audio: pw-loopback, for the virtual microphone')
+provides=("soundbridge=$pkgver")
+conflicts=('soundbridge')
+# The binaries come stripped of debug information, so there is none to split off.
+options=('!debug')
+_dir="soundbridge-v$pkgver-linux-x86_64"
+_raw="https://raw.githubusercontent.com/ccptr/SoundBridge/v$pkgver/crates/desktop/assets"
+source=(
+  "$url/releases/download/v$pkgver/$_dir.tar.gz"
+  "soundbridge-$pkgver.desktop::$_raw/soundbridge.desktop"
+  "soundbridge-$pkgver.svg::$_raw/soundbridge.svg"
+)
+sha256sums=('82e7259753f859d7e812b51bcaac3bd61264a8902d5155588d94a72e26243ea4'
+            'f644d9d50405be84732381ba5b335ca5691a366670b02f844540b8f7258d78d5'
+            '87c1e9c13b83b389cf8b9efbf1e30ff81548b97cf9fd5076c449a889c3d582d6')
+
+package() {
+  install -Dm755 -t "$pkgdir/usr/bin" "$_dir/soundbridge" "$_dir/soundbridge-desktop"
+  install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname" "$_dir/README.md"
+  install -Dm644 "soundbridge-$pkgver.desktop" "$pkgdir/usr/share/applications/soundbridge.desktop"
+  install -Dm644 "soundbridge-$pkgver.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/soundbridge.svg"
+}
