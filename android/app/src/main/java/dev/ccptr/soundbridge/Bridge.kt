@@ -67,7 +67,7 @@ data class Settings(
     /** The last address typed into the connect box. */
     val host: String = "",
 ) {
-    /** What is sent, in the engine's order, which is the order of its stream slots. */
+    /** What is sent, in the engine's order, which is how it tells us of each. */
     val sources: List<String>
         get() = listOfNotNull("mic".takeIf { sendMic }, "system".takeIf { sendPhoneAudio })
 
@@ -118,8 +118,10 @@ data class RxStats(
 
 /** A microphone the other device sends, and how it is set there. */
 data class RemoteMic(
-    /** The other device's number for the stream, from 0. */
+    /** The other device's slot for the stream, for as long as it is connected. */
     val slot: Int,
+    /** What the other device calls it; empty if it does not say. */
+    val name: String,
     val settings: MicSettings,
 )
 
@@ -424,7 +426,7 @@ object Bridge : Native.Listener {
             )
         },
         remoteMics = o.list("sources") { it }.filter { it.optString("kind") == "mic" }.map {
-            RemoteMic(it.optInt("slot"), parseMic(it, Gate.VOICE))
+            RemoteMic(it.optInt("slot"), it.optString("name"), parseMic(it, Gate.VOICE))
         },
     )
 }

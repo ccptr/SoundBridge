@@ -31,8 +31,8 @@ pub use audio::{
     SourceKind, StreamFormat, StreamHandle,
 };
 pub use engine::{
-    BufferMode, Config, Engine, Event, Peer, RxStats, SinkConfig, SourceConfig, State, Stats,
-    Streams, TxStats,
+    BufferMode, Config, Engine, Event, Peer, RemoteStream, RxStats, SinkConfig, SourceConfig, State,
+    Stats, Streams, TxStats,
 };
 pub use protocol::{DEFAULT_PORT, Report, SourceSettings};
 

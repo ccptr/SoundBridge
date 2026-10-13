@@ -21,11 +21,11 @@ recording.
 
 | Goal | Phone | PC |
 |---|---|---|
-| Phone as the PC's microphone | Send: Microphone | Play stream 1: Virtual mic |
+| Phone as the PC's microphone | Send: Microphone | Play Microphone: Virtual microphone |
 | Hear the PC on the phone | Play: on | Send: PC audio |
-| Hear the phone on the PC | Send: Phone audio | Play stream 1: Speakers |
+| Hear the phone on the PC | Send: Phone audio | Play Device audio: Default output |
 | PC microphone to the phone | Play: on | Send: Microphone |
-| Phone as microphone, and hear the phone too | Send: Microphone + Phone audio | Play stream 1: Virtual mic, stream 2: Speakers |
+| Phone as microphone, and hear the phone too | Send: Microphone + Phone audio | Play Microphone: Virtual microphone, Device audio: Default output |
 
 The apps find each other on the local network; an address can also be typed
 in. With the CLI:
@@ -35,8 +35,8 @@ soundbridge listen --play virtual-mic          # PC: wait for the phone, expose 
 soundbridge connect 192.168.1.20 --send system --play none   # PC: send its audio to a listening phone
 soundbridge discover                           # who is listening?
 soundbridge devices                            # device ids for --send mic=ID / --play speaker=ID
-soundbridge listen --play 1:virtual-mic --play 2:speaker         # each stream somewhere else
-soundbridge listen --play 2:speaker=ID --play speaker            # the second stream on a device of its own
+soundbridge listen --play mic:virtual-mic --play system:speaker  # each stream somewhere else
+soundbridge listen --play system:speaker=ID --play speaker       # one stream on a device of its own
 soundbridge connect HOST --send mic --send system --denoise      # two streams; the mic voice only
 soundbridge connect HOST --send mic --denoise=whole              # voice only, keeping the start of every word
 soundbridge listen --play virtual-mic --remote denoise=whole     # the same, set from the end that hears it
@@ -49,40 +49,51 @@ soundbridge connect HOST --send tone --play none
 
 ### Where each stream plays
 
-Streams are numbered from 1 in the order the sending end lists its sources:
-the order of `--send` on the command line and of the list in the desktop
-app; on a phone the microphone comes before phone audio. The receiving end
-gives each of them its place by that number ("Play what the other device
-sends" in the desktop app, `--play N:SINK` on the command line), and not by
-what it carries. Two microphones from the same machine go to different
-devices like this:
+A stream is known at both ends by its **source**: the id of the device it is
+captured from, as `soundbridge devices` lists it on the sending machine. The
+default microphone is `mic` and what the machine plays on its default output
+is `system`; those are also the two a phone has. The id does not change when
+other sources are added or removed, or when the stream is renamed.
+
+Next to the id a stream has a **name**, which is only what it is shown as.
+It starts as the name of the device and can be changed on the sending end:
+"Rename" in the desktop app, `--send NAME:mic=ID` on the command line.
+
+The receiving end gives each stream its place by its source ("Play what the
+other device sends" in the desktop app, `--play SOURCE:SINK` on the command
+line). Two microphones from the same machine go to different devices like
+this:
 
 ```sh
-soundbridge connect HOST --send mic=HEADSET --send mic=WEBCAM --send system
-soundbridge listen --play 1:virtual-mic --play 2:speaker=ID --play speaker
+soundbridge connect HOST --send headset:mic=HEADSET --send mic=WEBCAM --send system
+soundbridge listen --play HEADSET:virtual-mic --play WEBCAM:speaker=ID --play speaker
 ```
 
-- A stream that is given no place plays on the default speakers in the
-  desktop app, and on the command line wherever a `--play` without a number
-  says (`--play speaker` if there is none). Above, that is the third stream.
-- A stream that is given a place plays only there.
-- Given two places, it plays in both.
-- `--play N:none` ("Nothing" in the app) plays it nowhere, while the rest
-  carry on.
-- The number is a position, not a name: when the sending end removes a
-  source, the ones after it move up.
+- The desktop app lists each stream the other device sends under its name,
+  with one list to choose from: nothing, the default output, each output
+  device, and the virtual microphone. What was chosen is kept with the
+  source's id for the next time that device sends it.
+- A stream that is given no place plays on the default output in the desktop
+  app, and on the command line wherever a `--play` without a source says
+  (`--play speaker` if there is none). Above, that is what the PC plays.
+- A stream that is given a place plays only there. On the command line it
+  can be given two, and plays in both.
+- `--play SOURCE:none` ("Nothing" in the app) plays it nowhere, while the
+  rest carry on.
+- A source can be sent once: a second stream from the same device is not
+  sent, and that is said.
+- The command line prints each source the peer sends when it first arrives
+  (`The peer sends ID (name)`), and shows streams by name after that. The
+  Android app plays everything in one place.
 
-The desktop app shows the number next to each source it sends and each stream
-it receives, and while connected lists the streams the other device sends
-with where each plays. The command line puts the number in front of each
-stream once there are several (`recv 2:mic`). The Android app plays
-everything in one place.
-
-Through 0.3.0 a place could also be given to a kind of stream (`--play
-mic:SINK`, and "Play the other device's microphone" in the desktop app).
-That is gone: the command line rejects it, and the desktop app forgets
-what was set that way, so everything plays on the default speakers until
-the streams are given their places again.
+Through 0.3.0 a place was given to a kind of stream or to its number in the
+sender's list (`--play mic:SINK`, `--play 2:SINK`, "Play the other device's
+microphone" and numbered streams in the desktop app). Numbers are gone: the
+command line reads what is before the colon as a source, and the desktop app
+forgets what was set by kind or number, so everything plays on the default
+output until the streams are given their places again. A peer still on 0.3.0
+does not say what its sources are; its microphones are all taken to be `mic`
+and what it plays `system`.
 
 ### Voice only
 
@@ -140,12 +151,12 @@ and how each microphone is set, and either end can change those settings:
 - On the command line, `--remote SETTING=VALUE` sets the microphones the peer
   sends: `denoise=MODE` (`off`, `reduce`, `voice`, `whole`, or
   `gate:LOOKAHEAD:HOLD:THRESHOLD` for a tuning of the gate),
-  `auto-gain=on|off` or `gain=DB`. A number in front is for one stream only.
+  `auto-gain=on|off` or `gain=DB`. A source in front is for that stream only.
   What is not mentioned stays as the peer has it.
 
 ```sh
 soundbridge listen --play virtual-mic --remote denoise=voice --remote gain=6
-soundbridge listen --play speaker --remote 2:denoise=gate:80:400:0.4 --remote 2:auto-gain=on
+soundbridge listen --play speaker --remote mic:denoise=gate:80:400:0.4 --remote mic:auto-gain=on
 ```
 
 - The change is made on the sending device, as if it had been chosen there:

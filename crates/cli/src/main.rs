@@ -15,7 +15,6 @@ use soundbridge_core::{
     AudioBackend, BufferMode, Config, DEFAULT_PORT, DeviceDirection, Engine, Event, SinkConfig,
     SinkKind, SourceConfig, SourceKind, SourceSettings, State, Stats, StreamFormat, Streams,
 };
-use soundbridge_core::protocol::MAX_STREAMS;
 
 /// A low-latency audio bridge between machines on the same network.
 ///
@@ -34,14 +33,15 @@ Examples:
   Use a phone as this PC's microphone (the phone connects and sends its mic):
     soundbridge listen --play virtual-mic
 
-  The same, while also hearing what the phone is playing (it sends its
-  microphone first, so that is stream 1):
-    soundbridge listen --play 1:virtual-mic --play speaker
+  The same, while also hearing what the phone is playing (a phone's
+  microphone is the source `mic`, what it plays is `system`):
+    soundbridge listen --play mic:virtual-mic --play speaker
 
-  Send two microphones, and at the other end play the second on a device of
-  its own and the rest on the default one:
-    soundbridge connect 192.168.1.20 --send mic=ID --send mic=OTHER
-    soundbridge listen --play 2:speaker=ID --play speaker
+  Send two microphones under names of their own, and at the other end play
+  the second on a device of its own and the rest on the default one. A
+  stream is known by the id of the device it is captured from:
+    soundbridge connect 192.168.1.20 --send headset:mic=ID --send desk:mic=OTHER
+    soundbridge listen --play OTHER:speaker=OUTPUT --play speaker
 
   Hear this PC on the phone (the phone is listening):
     soundbridge connect 192.168.1.20 --send system --play none
@@ -119,9 +119,11 @@ fn parse_switch(s: &str) -> Result<bool, String> {
     }
 }
 
-/// One `--send`: a kind of source, and optionally which device.
+/// One `--send`: a kind of source, and optionally what the stream is called
+/// and which device it is captured from.
 #[derive(Clone)]
 struct Source {
+    name: Option<String>,
     kind: SourceKind,
     device: Option<String>,
 }
@@ -136,10 +138,10 @@ struct Sink {
 }
 
 /// One `--remote`: a setting for the microphones the peer sends, or for the
-/// one stream that is numbered.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// one whose source is named.
+#[derive(Clone, Debug, PartialEq)]
 struct Remote {
-    slot: Option<u8>,
+    source: Option<String>,
     change: Change,
 }
 
@@ -151,9 +153,10 @@ enum Change {
 }
 
 impl Remote {
-    /// `source` as it is wanted, if this is about it.
-    fn apply(&self, source: SourceSettings) -> SourceSettings {
-        if self.slot.is_some_and(|slot| slot != source.slot) {
+    /// `source`, which the peer knows by `id`, as it is wanted, if this is
+    /// about it.
+    fn apply(&self, source: SourceSettings, id: &str) -> SourceSettings {
+        if self.source.as_ref().is_some_and(|wanted| wanted != id) {
             return source;
         }
         match self.change {
@@ -164,13 +167,25 @@ impl Remote {
     }
 }
 
-fn parse_remote(s: &str) -> Result<Remote, String> {
-    let (slot, setting) = match s.split_once(':') {
-        Some((number, setting)) if number.starts_with(|c: char| c.is_ascii_digit()) => {
-            (Some(parse_slot(number)?), setting)
-        }
-        _ => (None, s),
+/// Splits `[SOURCE:]REST`, where REST starts with one of `words`, alone or
+/// with `=` after it. SOURCE is a device id, which may hold anything.
+fn split_source<'a>(s: &'a str, words: &[&str]) -> (Option<&'a str>, &'a str) {
+    let starts = |rest: &str| {
+        words.iter().any(|word| rest.strip_prefix(word).is_some_and(|after| after.is_empty() || after.starts_with('=')))
     };
+    if starts(s) {
+        return (None, s);
+    }
+    let colon = s.match_indices(':').map(|(at, _)| at).find(|&at| starts(&s[at + 1..]));
+    match colon {
+        Some(at) => (Some(&s[..at]), &s[at + 1..]),
+        None => (None, s),
+    }
+}
+
+fn parse_remote(s: &str) -> Result<Remote, String> {
+    let (source, setting) = split_source(s, &["denoise", "auto-gain", "gain"]);
+    let source = source.map(str::to_string);
     let expected = "expected denoise=MODE, auto-gain=on|off or gain=DB";
     let (name, value) = setting.split_once('=').ok_or_else(|| format!("'{setting}' is not a setting: {expected}"))?;
     let change = match name {
@@ -179,7 +194,7 @@ fn parse_remote(s: &str) -> Result<Remote, String> {
         "gain" => Change::Gain(parse_gain(value)?),
         _ => return Err(format!("'{name}' is not a setting: {expected}")),
     };
-    Ok(Remote { slot, change })
+    Ok(Remote { source, change })
 }
 
 fn parse_kind(s: &str) -> Result<SourceKind, String> {
@@ -201,16 +216,23 @@ fn split_device(s: &str) -> (&str, Option<String>) {
 }
 
 fn parse_source(s: &str) -> Result<Source, String> {
-    let (kind, device) = split_device(s);
-    Ok(Source { kind: parse_kind(kind)?, device })
+    let (what, device) = split_device(s);
+    // The name may itself hold a colon; the kind cannot.
+    let (name, kind) = match what.rsplit_once(':') {
+        Some((name, kind)) => (Some(name.to_string()).filter(|name| !name.is_empty()), kind),
+        None => (None, what),
+    };
+    Ok(Source { name, kind: parse_kind(kind)?, device })
 }
 
 fn parse_sink(s: &str) -> Result<Sink, String> {
-    let (what, device) = split_device(s);
-    let (from, sink) = match what.split_once(':') {
-        Some((number, sink)) => (Streams::Slot(parse_slot(number)?), sink),
-        None => (Streams::All, what),
+    let (source, sink) = split_source(s, &["speaker", "virtual-mic", "null", "none"]);
+    let from = match source {
+        Some("") => return Err("there is no source before the colon".into()),
+        Some(source) => Streams::Source(source.to_string()),
+        None => Streams::All,
     };
+    let (sink, device) = split_device(sink);
     let kind = match sink {
         "speaker" => Some(SinkKind::Speaker),
         "virtual-mic" => Some(SinkKind::VirtualMic),
@@ -221,23 +243,17 @@ fn parse_sink(s: &str) -> Result<Sink, String> {
     Ok(Sink { from, kind, device })
 }
 
-/// The part of a `--play` before the colon: the number of one of the peer's
-/// streams, counted from 1.
-fn parse_slot(s: &str) -> Result<u8, String> {
-    match s.parse::<usize>() {
-        Ok(number) if (1..=MAX_STREAMS).contains(&number) => Ok(number as u8 - 1),
-        _ => Err(format!("'{s}' is not a stream: they are numbered 1 to {MAX_STREAMS}")),
-    }
-}
-
 #[derive(Args)]
 struct LinkArgs {
     /// Capture and send audio from this machine: `mic` (a microphone or
     /// other input), `system` (whatever this machine is playing) or `tone`
     /// (a 440 Hz test tone). Add `=ID` to pick the device (see `soundbridge
     /// devices`); for `system` that is the output whose playback is
-    /// captured. Repeat to send several streams
-    #[arg(short, long, value_name = "SOURCE[=ID]", value_parser = parse_source)]
+    /// captured. Repeat to send several streams. The peer knows each by
+    /// its source: the ID of the device, or without one `mic`, `system` or
+    /// `tone`. Prefix `NAME:` to tell it what to show the stream as
+    /// [default: the name of the device, if one is picked]
+    #[arg(short, long, value_name = "[NAME:]SOURCE[=ID]", value_parser = parse_source)]
     send: Vec<Source>,
     /// Channels to send [default: 1 for mic, 2 for system]
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..=2))]
@@ -280,21 +296,22 @@ struct LinkArgs {
     /// What to do with audio received from the peer: `speaker` (an output
     /// device), `virtual-mic` (a microphone other applications can record
     /// from; PipeWire), `null` (receive and measure, play nothing) or `none`
-    /// (ignore it). Add `=ID` to pick the device. Prefix a number to play
-    /// one stream there, the peer's first --send being `1:`; that stream
-    /// then plays nowhere else, and with `none` nowhere at all. Repeat to
-    /// give each stream a place; without a number it is where the streams
-    /// that have none go
-    #[arg(short, long, value_name = "[N:]SINK[=ID]", default_value = "speaker", value_parser = parse_sink)]
+    /// (ignore it). Add `=ID` to pick the device. Prefix the peer's id for
+    /// a source to play that one stream there (`mic:`, `system:`, or the id
+    /// of the device it captures from, which is printed when the stream
+    /// first arrives); that stream then plays nowhere else, and with `none`
+    /// nowhere at all. Repeat to give each stream a place; without a source
+    /// it is where the streams that have none go
+    #[arg(short, long, value_name = "[SOURCE:]SINK[=ID]", default_value = "speaker", value_parser = parse_sink)]
     play: Vec<Sink>,
 
     /// Set how the peer filters and levels the microphones it sends, as if
     /// that had been set there: `denoise=MODE` (off, reduce, voice, whole,
     /// or gate:LOOKAHEAD:HOLD:THRESHOLD for a tuning of the gate),
-    /// `auto-gain=on|off` or `gain=DB`. Prefix a number for one stream only
-    /// (`2:gain=6`). Repeat for several settings. What is not mentioned
-    /// stays as the peer has it
-    #[arg(long, value_name = "[N:]SETTING=VALUE", value_parser = parse_remote)]
+    /// `auto-gain=on|off` or `gain=DB`. Prefix the peer's id for a source
+    /// for that one only (`mic:gain=6`). Repeat for several settings. What
+    /// is not mentioned stays as the peer has it
+    #[arg(long, value_name = "[SOURCE:]SETTING=VALUE", value_parser = parse_remote)]
     remote: Vec<Remote>,
 
     /// Jitter buffer: `auto` adapts to the network, or a fixed size in ms
@@ -391,6 +408,8 @@ impl LinkArgs {
             discover: false,
             send: (self.send.iter())
                 .map(|source| SourceConfig {
+                    id: SourceConfig::id_of(source.kind, source.device.as_deref()),
+                    name: source.name.clone().unwrap_or_default(),
                     kind: source.kind,
                     device: source.device.clone(),
                     channels: self.channels,
@@ -401,13 +420,13 @@ impl LinkArgs {
                 .collect(),
             play: (self.play.iter())
                 .filter_map(|sink| {
-                    let kind = match (sink.kind, sink.from) {
+                    let kind = match (sink.kind, &sink.from) {
                         (Some(kind), _) => kind,
                         // Said of one stream, `none` takes it off the other sinks.
-                        (None, Streams::Slot(_)) => SinkKind::Nothing,
+                        (None, Streams::Source(_)) => SinkKind::Nothing,
                         (None, _) => return None,
                     };
-                    Some(SinkConfig { kind, device: sink.device.clone(), from: sink.from })
+                    Some(SinkConfig { kind, device: sink.device.clone(), from: sink.from.clone() })
                 })
                 .collect(),
             packet_ms: self.packet,
@@ -439,10 +458,10 @@ fn main() -> ExitCode {
     #[cfg(feature = "self-update")]
     let updated = matches!(command, Command::Listen { .. } | Command::Connect { .. }).then(auto_update);
     let result = match command {
-        Command::Listen { port, once, link } => run_link(link.config(port, true), None, once, &link),
+        Command::Listen { port, once, link } => run_link(named(link.config(port, true)), None, once, &link),
         Command::Connect { peer, link } => match resolve(&peer) {
             // Any free local port: the dialer does not need to be findable.
-            Ok(addr) => run_link(link.config(0, false), Some(addr), true, &link),
+            Ok(addr) => run_link(named(link.config(0, false)), Some(addr), true, &link),
             Err(e) => Err(e),
         },
         Command::Discover { timeout } => discover(timeout),
@@ -554,6 +573,27 @@ fn discover(timeout: f32) -> Result<(), String> {
     Ok(())
 }
 
+/// Calls each source that was given a device and no name what that device
+/// is called.
+fn named(mut config: Config) -> Config {
+    let unnamed = |source: &SourceConfig| source.name.is_empty() && source.device.is_some();
+    if !config.send.iter().any(unnamed) {
+        return config;
+    }
+    let devices = CpalBackend::new().devices();
+    for source in config.send.iter_mut().filter(|source| unnamed(source)) {
+        let direction = match source.kind {
+            SourceKind::System => DeviceDirection::Output,
+            _ => DeviceDirection::Input,
+        };
+        let device = devices.iter().find(|d| Some(&d.id) == source.device.as_ref() && d.direction == direction);
+        if let Some(device) = device {
+            source.name = device.name.clone();
+        }
+    }
+    config
+}
+
 /// How a source is filtered and levelled, in the words of `--remote`.
 fn settings_text(source: &SourceSettings) -> String {
     let auto_gain = if source.auto_gain { "on" } else { "off" };
@@ -564,6 +604,9 @@ fn settings_text(source: &SourceSettings) -> String {
 /// session ends.
 fn run_link(config: Config, dial: Option<SocketAddr>, until_idle: bool, link: &LinkArgs) -> Result<(), String> {
     let port = config.port;
+    let sent = (config.send.iter())
+        .map(|source| if source.name.is_empty() { source.id.clone() } else { source.name.clone() })
+        .collect();
     let (tx, rx) = mpsc::channel();
     let events = tx.clone();
     let engine = Engine::start(config, Arc::new(CpalBackend::new()), move |e| {
@@ -581,7 +624,7 @@ fn run_link(config: Config, dial: Option<SocketAddr>, until_idle: bool, link: &L
         let _ = tx.send(None);
     });
 
-    let mut status = Status::new(link.quiet, std::io::stderr().is_terminal());
+    let mut status = Status::new(link.quiet, std::io::stderr().is_terminal(), sent);
     match dial {
         Some(addr) => engine.connect(addr),
         None => status.line(&format!("Listening on port {}", engine.local_port())),
@@ -592,12 +635,15 @@ fn run_link(config: Config, dial: Option<SocketAddr>, until_idle: bool, link: &L
     // The peer's streams that --remote has been applied to. Each is asked
     // once: after that, what is set at the other end stands.
     let mut asked: Vec<u8> = Vec::new();
+    // The sources the peer has been seen to send.
+    let mut seen: Vec<String> = Vec::new();
     while let Ok(Some(event)) = rx.recv() {
         match event {
             Event::State(State::Connecting { addr }) => status.line(&format!("Connecting to {addr}...")),
             Event::State(State::Connected { addr, name }) => {
                 was_connected = true;
                 asked.clear();
+                seen.clear();
                 status.line(&format!("Connected to {name} ({addr})"));
             }
             Event::State(State::Idle) => {
@@ -611,22 +657,34 @@ fn run_link(config: Config, dial: Option<SocketAddr>, until_idle: bool, link: &L
             }
             Event::Stats(stats) => {
                 let tunable = |source: &&SourceSettings| source.kind != SourceKind::System;
+                // Said once for each, as its id is what --play and --remote take.
+                seen.retain(|id| stats.remote_streams.iter().any(|stream| stream.id == *id));
+                for stream in &stats.remote_streams {
+                    if !seen.contains(&stream.id) {
+                        seen.push(stream.id.clone());
+                        let called = if stream.name.is_empty() { String::new() } else { format!(" ({})", stream.name) };
+                        status.line(&format!("The peer sends {}{called}", stream.id));
+                    }
+                }
                 asked.retain(|slot| stats.remote_sources.iter().filter(tunable).any(|s| s.slot == *slot));
                 for source in stats.remote_sources.iter().filter(tunable) {
                     if link.remote.is_empty() || asked.contains(&source.slot) {
                         continue;
                     }
+                    // Which source it is comes a moment after how it is set.
+                    let Some(stream) = stats.remote_stream(source.slot) else { continue };
                     asked.push(source.slot);
-                    let wanted = link.remote.iter().fold(*source, |source, remote| remote.apply(source));
+                    let wanted = link.remote.iter().fold(*source, |source, remote| remote.apply(source, &stream.id));
                     if wanted != *source {
                         engine.set_remote(wanted);
-                        status.line(&format!("Asking for stream {}: {}", source.slot + 1, settings_text(&wanted)));
+                        status.line(&format!("Asking for {}: {}", stream.id, settings_text(&wanted)));
                     }
                 }
                 status.stats(&stats)
             }
-            Event::SourceChanged(source) => {
-                status.line(&format!("The peer set stream {}: {}", source.slot + 1, settings_text(&source)))
+            Event::SourceChanged { source, settings } => {
+                let name = status.sent.get(source).cloned().unwrap_or_default();
+                status.line(&format!("The peer set {name}: {}", settings_text(&settings)))
             }
             Event::Info(message) => status.line(&message),
             Event::Error(message) => status.line(&format!("error: {message}")),
@@ -646,13 +704,15 @@ struct Status {
     tty: bool,
     drawn: bool,
     last_logged: Option<Instant>,
+    /// What each of the sources this end sends goes by.
+    sent: Vec<String>,
 }
 
 const LOG_STATS_EVERY: Duration = Duration::from_secs(5);
 
 impl Status {
-    fn new(quiet: bool, tty: bool) -> Self {
-        Status { quiet, tty, drawn: false, last_logged: None }
+    fn new(quiet: bool, tty: bool, sent: Vec<String>) -> Self {
+        Status { quiet, tty, drawn: false, last_logged: None, sent }
     }
 
     fn clear(&mut self) {
@@ -686,7 +746,9 @@ impl Status {
                 Mode::Reduce => " less noise",
                 Mode::Gate(_) => " voice only",
             };
-            let mut part = format!("send {}{filtered} {}", stream(tx.slot, tx.kind, tx.format, brief), meter(tx.level));
+            let name = self.sent.get(tx.source).map(String::as_str).unwrap_or_default();
+            let stream = stream(name, tx.format, brief);
+            let mut part = format!("send {stream}{filtered} {}", meter(tx.level));
             if let Some(remote) = tx.remote.filter(|_| !brief) {
                 part += &format!(" > peer buffer {:.1} ms", remote.buffer_us as f32 / 1000.0);
                 if remote.lost > 0 || remote.underruns > 0 {
@@ -699,7 +761,7 @@ impl Status {
             let state = if rx.playing { "" } else { " (buffering)" };
             let mut part = format!(
                 "recv {} {} buffer {:.1} ms{state}",
-                stream(rx.slot, rx.kind, rx.format, brief),
+                stream(&remote_name(stats, rx.slot, rx.kind), rx.format, brief),
                 meter(rx.level),
                 rx.buffer_ms
             );
@@ -729,15 +791,19 @@ impl Status {
     }
 }
 
-/// Names a stream by what it carries: at length, or just its kind, behind
-/// the number `--play N:` knows it by.
-fn stream(slot: u8, kind: SourceKind, format: StreamFormat, brief: bool) -> String {
-    let kind = match kind {
-        SourceKind::Mic => "mic",
-        SourceKind::System => "system",
-        SourceKind::Tone => "tone",
-    };
-    if brief { format!("{}:{kind}", slot + 1) } else { format!("{kind} {format}") }
+/// What a stream the peer sends goes by: the name it has there, or failing
+/// that the id of its source.
+fn remote_name(stats: &Stats, slot: u8, kind: SourceKind) -> String {
+    match stats.remote_stream(slot) {
+        Some(stream) if !stream.name.is_empty() => stream.name.clone(),
+        Some(stream) => stream.id.clone(),
+        None => SourceConfig::id_of(kind, None),
+    }
+}
+
+/// A stream in the statistics line: at length, or just what it goes by.
+fn stream(name: &str, format: StreamFormat, brief: bool) -> String {
+    if brief { name.to_string() } else { format!("{name} {format}") }
 }
 
 /// A five-step level meter covering roughly the top 40 dB.
@@ -779,6 +845,13 @@ mod tests {
         assert_eq!((source.kind, source.device.as_deref()), (SourceKind::Mic, Some("pipewire:alsa_input.usb={a=b}")));
         assert!(parse_source("system").unwrap().device.is_none());
         assert!(parse_source("loud").is_err());
+        let source = parse_source("Desk: left:mic=alsa:hw:1").unwrap();
+        assert_eq!(
+            (source.name.as_deref(), source.kind, source.device.as_deref()),
+            (Some("Desk: left"), SourceKind::Mic, Some("alsa:hw:1"))
+        );
+        assert!(parse_source(":tone").unwrap().name.is_none());
+        assert!(parse_source("mic:loud").is_err());
 
         let sink = parse_sink("speaker=wasapi:{0.0}").unwrap();
         assert_eq!(
@@ -786,36 +859,39 @@ mod tests {
             (Streams::All, Some(SinkKind::Speaker), Some("wasapi:{0.0}"))
         );
         assert!(parse_sink("none").unwrap().kind.is_none());
-        assert!(parse_sink("1:loud").is_err());
-        assert!(parse_sink("loud:speaker").is_err());
-        // Streams are no longer picked by what they carry.
-        assert!(parse_sink("mic:virtual-mic").is_err());
+        assert!(parse_sink("mic:loud").is_err());
+        assert!(parse_sink(":speaker").is_err());
 
-        // Streams are counted from 1 on the command line, slots from 0.
-        let sink = parse_sink("2:speaker=pipewire:out:1").unwrap();
+        // A stream is picked by the id of its source, which may hold what
+        // the rest is told apart by.
+        let source = |id: &str| Streams::Source(id.into());
+        let sink = parse_sink("mic:virtual-mic").unwrap();
+        assert_eq!((sink.from, sink.kind), (source("mic"), Some(SinkKind::VirtualMic)));
+        let sink = parse_sink("pipewire:alsa_input.usb=1:speaker=pipewire:out:null").unwrap();
         assert_eq!(
             (sink.from, sink.kind, sink.device.as_deref()),
-            (Streams::Slot(1), Some(SinkKind::Speaker), Some("pipewire:out:1"))
+            (source("pipewire:alsa_input.usb=1"), Some(SinkKind::Speaker), Some("pipewire:out:null"))
         );
-        assert!(parse_sink("0:speaker").is_err());
-        assert!(parse_sink("65:speaker").is_err());
-        assert!(parse_sink("2nd:speaker").is_err());
+        let sink = parse_sink("alsa:null:none").unwrap();
+        assert_eq!((sink.from, sink.kind), (source("alsa:null"), None));
+        let sink = parse_sink("speaker=alsa:null").unwrap();
+        assert_eq!((sink.from, sink.device.as_deref()), (Streams::All, Some("alsa:null")));
     }
 
     #[test]
     fn one_stream_somewhere_else_or_nowhere() {
         let cli = Cli::try_parse_from([
-            "soundbridge", "listen", "--play", "1:virtual-mic", "--play", "3:none", "--play", "none", "--play",
-            "speaker",
+            "soundbridge", "listen", "--play", "mic:virtual-mic", "--play", "wasapi:{0.1}:none", "--play", "none",
+            "--play", "speaker",
         ])
         .unwrap();
         let Command::Listen { link, .. } = cli.command else { panic!() };
-        let played: Vec<_> = link.config(0, true).play.iter().map(|s| (s.from, s.kind)).collect();
+        let played: Vec<_> = link.config(0, true).play.into_iter().map(|s| (s.from, s.kind)).collect();
         assert_eq!(
             played,
             [
-                (Streams::Slot(0), SinkKind::VirtualMic),
-                (Streams::Slot(2), SinkKind::Nothing),
+                (Streams::Source("mic".into()), SinkKind::VirtualMic),
+                (Streams::Source("wasapi:{0.1}".into()), SinkKind::Nothing),
                 (Streams::All, SinkKind::Speaker)
             ]
         );
@@ -836,20 +912,20 @@ mod tests {
     #[test]
     fn several_streams_each_way() {
         let cli = Cli::try_parse_from([
-            "soundbridge", "listen", "--denoise", "--send", "mic", "--send", "system", "--play", "1:virtual-mic",
-            "--play", "2:speaker", "--play", "none",
+            "soundbridge", "listen", "--denoise", "--send", "mic", "--send", "system", "--play", "mic:virtual-mic",
+            "--play", "system:speaker", "--play", "none",
         ])
         .unwrap();
         let Command::Listen { link, .. } = cli.command else { panic!() };
         let config = link.config(0, true);
-        let sent: Vec<_> = config.send.iter().map(|s| (s.kind, s.denoise)).collect();
-        assert_eq!(sent, [(SourceKind::Mic, Mode::VOICE), (SourceKind::System, Mode::Off)]);
-        let played: Vec<_> = config.play.iter().map(|s| (s.from, s.kind)).collect();
+        let sent: Vec<_> = config.send.iter().map(|s| (s.id.as_str(), s.kind, s.denoise)).collect();
+        assert_eq!(sent, [("mic", SourceKind::Mic, Mode::VOICE), ("system", SourceKind::System, Mode::Off)]);
+        let played: Vec<_> = config.play.into_iter().map(|s| (s.from, s.kind)).collect();
         assert_eq!(
             played,
             [
-                (Streams::Slot(0), SinkKind::VirtualMic),
-                (Streams::Slot(1), SinkKind::Speaker)
+                (Streams::Source("mic".into()), SinkKind::VirtualMic),
+                (Streams::Source("system".into()), SinkKind::Speaker)
             ]
         );
 
@@ -888,36 +964,45 @@ mod tests {
     #[test]
     fn settings_for_the_peer() {
         let remote = |s| parse_remote(s).unwrap();
-        assert_eq!(remote("denoise=whole"), Remote { slot: None, change: Change::Denoise(Mode::WHOLE_WORDS) });
+        assert_eq!(remote("denoise=whole"), Remote { source: None, change: Change::Denoise(Mode::WHOLE_WORDS) });
         assert_eq!(
-            remote("2:denoise=gate:80:400:0.4"),
+            remote("pipewire:usb=1:denoise=gate:80:400:0.4"),
             Remote {
-                slot: Some(1),
+                source: Some("pipewire:usb=1".into()),
                 change: Change::Denoise(Mode::Gate(Gate { lookahead_ms: 80, hold_ms: 400, threshold: 0.4 }))
             }
         );
         assert_eq!(remote("auto-gain=off").change, Change::AutoGain(false));
-        assert_eq!(remote("1:gain=-6"), Remote { slot: Some(0), change: Change::Gain(-6.0) });
-        for bad in ["denoise", "loud=1", "gain=90", "auto-gain=maybe", "0:gain=6", "denoise=gate:80"] {
+        assert_eq!(remote("mic:gain=-6"), Remote { source: Some("mic".into()), change: Change::Gain(-6.0) });
+        for bad in ["denoise", "loud=1", "gain=90", "auto-gain=maybe", "mic:loud=6", "denoise=gate:80"] {
             assert!(parse_remote(bad).is_err(), "{bad}");
         }
 
         // Each stream takes what is said of all of them and of itself, in order.
         let cli = Cli::try_parse_from([
-            "soundbridge", "listen", "--remote", "denoise=voice", "--remote", "gain=6", "--remote", "2:gain=-6",
+            "soundbridge", "listen", "--remote", "denoise=voice", "--remote", "gain=6", "--remote", "desk:gain=-6",
         ])
         .unwrap();
         let Command::Listen { link, .. } = cli.command else { panic!() };
-        let source = |slot| SourceSettings {
-            slot,
-            kind: SourceKind::Mic,
-            denoise: Mode::Off,
-            auto_gain: true,
-            gain_db: 0.0,
-        };
-        let wanted = |slot| link.remote.iter().fold(source(slot), |source, remote| remote.apply(source));
-        assert_eq!(wanted(0), SourceSettings { denoise: Mode::VOICE, gain_db: 6.0, ..source(0) });
-        assert_eq!(wanted(1), SourceSettings { denoise: Mode::VOICE, gain_db: -6.0, ..source(1) });
+        let source =
+            SourceSettings { slot: 0, kind: SourceKind::Mic, denoise: Mode::Off, auto_gain: true, gain_db: 0.0 };
+        let wanted = |id| link.remote.iter().fold(source, |source, remote| remote.apply(source, id));
+        assert_eq!(wanted("mic"), SourceSettings { denoise: Mode::VOICE, gain_db: 6.0, ..source });
+        assert_eq!(wanted("desk"), SourceSettings { denoise: Mode::VOICE, gain_db: -6.0, ..source });
+    }
+
+    #[test]
+    fn a_stream_is_its_source_and_goes_by_a_name() {
+        let cli = Cli::try_parse_from([
+            "soundbridge", "connect", "host", "--send", "headset:mic=alsa:hw:1", "--send", "tone",
+        ]);
+        let Command::Connect { link, .. } = cli.unwrap().command else { panic!() };
+        let sent: Vec<_> = link.config(0, false).send.into_iter().map(|s| (s.id, s.name)).collect();
+        assert_eq!(sent, [("alsa:hw:1".to_string(), "headset".to_string()), ("tone".to_string(), String::new())]);
+
+        let format = StreamFormat { sample_rate: 48_000, channels: 1 };
+        assert_eq!(stream("headset", format, true), "headset");
+        assert_eq!(stream("headset", format, false), "headset 48.0 kHz mono");
     }
 
     #[test]

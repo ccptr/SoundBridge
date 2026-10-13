@@ -125,9 +125,10 @@ fn kind_name(kind: SourceKind) -> &'static str {
 }
 
 /// How a source is set, in the terms of the app's `MicSettings`. The gate's
-/// tuning is there only while the gate is on.
-fn source_json(o: &mut String, source: &SourceSettings) {
-    let _ = write!(o, r#""slot":{},"kind":"{}","denoise":"#, source.slot, kind_name(source.kind));
+/// tuning is there only while the gate is on. `slot` is what the app knows
+/// the source by.
+fn source_json(o: &mut String, slot: usize, source: &SourceSettings) {
+    let _ = write!(o, r#""slot":{slot},"kind":"{}","denoise":"#, kind_name(source.kind));
     match source.denoise {
         Mode::Off => o.push_str(r#""off""#),
         Mode::Reduce => o.push_str(r#""reduce""#),
@@ -182,7 +183,8 @@ fn event_json(event: &Event) -> String {
                 let _ = write!(
                     o,
                     r#"{{"slot":{},"kind":"{}","rate":{},"channels":{},"level":{},"denoise":{}"#,
-                    tx.slot,
+                    // Its place among what the app sends, which is how the app tells them apart.
+                    tx.source,
                     kind_name(tx.kind),
                     tx.format.sample_rate,
                     tx.format.channels,
@@ -227,14 +229,16 @@ fn event_json(event: &Event) -> String {
             o.push_str(r#"],"sources":["#);
             for (i, source) in stats.remote_sources.iter().enumerate() {
                 o.push_str(if i > 0 { ",{" } else { "{" });
-                source_json(&mut o, source);
+                source_json(&mut o, source.slot as usize, source);
+                o.push_str(r#","name":"#);
+                json_string(&mut o, stats.remote_stream(source.slot).map_or("", |stream| &stream.name));
                 o.push('}');
             }
             o.push_str("]}");
         }
-        Event::SourceChanged(source) => {
+        Event::SourceChanged { source, settings } => {
             o.push_str(r#"{"type":"source","#);
-            source_json(&mut o, source);
+            source_json(&mut o, *source, settings);
             o.push('}');
         }
         Event::Info(text) | Event::Error(text) => {

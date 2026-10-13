@@ -243,7 +243,7 @@ private fun RemoteMicsCard(link: Link.Connected, mics: List<RemoteMic>) {
                 "a change made here is made there, and stays.",
         )
         for (mic in mics) {
-            if (mics.size > 1) Text("Microphone · stream ${mic.slot + 1}")
+            if (mics.size > 1) Text(mic.name.ifEmpty { "Microphone" })
             MicControls(mic.settings) { change -> Bridge.updateRemoteMic(mic.slot, change) }
         }
     }

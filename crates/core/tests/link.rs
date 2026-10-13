@@ -141,6 +141,11 @@ fn tone_source(channels: u16) -> SourceConfig {
     SourceConfig { channels: Some(channels), ..SourceConfig::new(SourceKind::Tone) }
 }
 
+/// The sources under the ids "a", "b", "c" and so on.
+fn lettered<const N: usize>(sources: [SourceConfig; N]) -> Vec<SourceConfig> {
+    ('a'..).zip(sources).map(|(id, source)| SourceConfig { id: id.to_string(), ..source }).collect()
+}
+
 #[test]
 fn several_streams_one_way_each_play_on_every_sink() {
     let (listener, listener_events) = engine(Config {
@@ -148,7 +153,7 @@ fn several_streams_one_way_each_play_on_every_sink() {
         ..config("listener")
     });
     let (dialer, dialer_events) = engine(Config {
-        send: vec![tone_source(1), tone_source(2), tone_source(1)],
+        send: lettered([tone_source(1), tone_source(2), tone_source(1)]),
         ..config("dialer")
     });
     dialer.connect(local(&listener));
@@ -170,38 +175,161 @@ fn several_streams_one_way_each_play_on_every_sink() {
         Event::Stats(Stats { tx, .. }) if tx.iter().all(|tx| tx.remote.is_some_and(|r| r.playing)) => Some(tx),
         _ => None,
     });
-    assert_eq!(tx.iter().map(|tx| (tx.slot, tx.remote.unwrap().slot)).collect::<Vec<_>>(), [(0, 0), (1, 1), (2, 2)]);
+    assert_eq!(tx.iter().map(|tx| (tx.source, tx.slot, tx.remote.unwrap().slot)).collect::<Vec<_>>(), [
+        (0, 0, 0),
+        (1, 1, 1),
+        (2, 2, 2)
+    ]);
 
-    // Dropping the last source leaves the others running, not restarted...
-    dialer.configure(Config { send: vec![tone_source(1), tone_source(2)], ..config("dialer") });
-    let after = wait_for(&dialer_events, "the third stream to stop", |e| match e {
+    // Dropping the first source leaves the others running, not restarted,
+    // and in the slots they had...
+    let rest = lettered([tone_source(1), tone_source(2), tone_source(1)]).split_off(1);
+    dialer.configure(Config { send: rest, ..config("dialer") });
+    let after = wait_for(&dialer_events, "the first stream to stop", |e| match e {
         Event::Stats(Stats { tx, .. }) if tx.len() == 2 => Some(tx),
         _ => None,
     });
-    assert!(after[0].packets >= tx[0].packets && after[1].packets >= tx[1].packets);
+    assert_eq!(after.iter().map(|tx| (tx.source, tx.slot)).collect::<Vec<_>>(), [(0, 1), (1, 2)]);
+    assert!(after[0].packets >= tx[1].packets && after[1].packets >= tx[2].packets);
     // ...and the far end closes what it had opened for the one that stopped.
-    wait_for(&listener_events, "the stopped stream's outputs to close", |e| match e {
-        Event::Stats(Stats { rx, .. }) if rx.len() == 4 => Some(()),
+    let stats = wait_for(&listener_events, "the stopped stream's outputs to close", |e| match e {
+        Event::Stats(stats) if stats.rx.len() == 4 && stats.remote_streams.len() == 2 => Some(stats),
         _ => None,
     });
+    assert!(stats.rx.iter().all(|rx| rx.slot != 0));
+    let sources: Vec<_> = stats.remote_streams.iter().map(|stream| (stream.slot, stream.id.as_str())).collect();
+    assert_eq!(sources, [(1, "b"), (2, "c")]);
 }
 
 #[test]
-fn a_stream_named_by_slot_goes_only_where_it_is_sent() {
+fn a_stream_is_known_by_its_source_and_goes_by_a_name() {
+    let headset = "pipewire:alsa_input.usb-headset";
+    let (listener, listener_events) = engine(Config {
+        play: vec![SinkConfig { from: Streams::Source(headset.into()), ..SinkConfig::new(SinkKind::Null) }],
+        ..config("listener")
+    });
+    let source = |id: &str, name: &str, channels| SourceConfig { id: id.into(), name: name.into(), ..tone_source(channels) };
+    let sent = |sources| Config { send: sources, ..config("dialer") };
+    // Two are the same source: the latecomer is not sent, and that is said.
+    let (dialer, dialer_events) =
+        engine(sent(vec![source("tone", "", 1), source(headset, "Headset", 2), source(headset, "Twin", 1)]));
+    let error = wait_for(&dialer_events, "the twin to be turned down", |e| match e {
+        Event::Error(error) => Some(error),
+        _ => None,
+    });
+    assert!(error.contains("Twin"), "{error}");
+    dialer.connect(local(&listener));
+
+    let stats = wait_for(&listener_events, "the headset to play", |e| match e {
+        Event::Stats(stats) if stats.rx.iter().any(|rx| rx.playing) => Some(stats),
+        Event::Error(e) => panic!("{e}"),
+        _ => None,
+    });
+    // Only the stream that was given a place plays, and it is the stereo one.
+    assert_eq!(stats.rx.iter().map(|rx| rx.format.channels).collect::<Vec<_>>(), [2]);
+    let named = |stats: &Stats| {
+        let mut streams: Vec<_> = stats.remote_streams.iter().map(|s| (s.id.clone(), s.name.clone())).collect();
+        streams.sort();
+        streams
+    };
+    assert_eq!(named(&stats), [(headset.to_string(), "Headset".to_string()), ("tone".to_string(), String::new())]);
+    let playing = stats.remote_stream(stats.rx[0].slot).unwrap();
+    assert_eq!((playing.id.as_str(), playing.name.as_str()), (headset, "Headset"));
+    let before = wait_for(&dialer_events, "sending to start", |e| match e {
+        Event::Stats(Stats { tx, .. }) if tx.len() == 2 => Some(tx),
+        _ => None,
+    });
+
+    // Renamed and moved up the list, the stream carries on as it was.
+    dialer.configure(sent(vec![source(headset, "Desk", 2), source("tone", "", 1)]));
+    wait_for(&listener_events, "the new name", |e| match e {
+        Event::Stats(stats) => stats.remote_streams.iter().any(|stream| stream.name == "Desk").then_some(()),
+        _ => None,
+    });
+    let after = wait_for(&dialer_events, "the moved stream", |e| match e {
+        Event::Stats(Stats { tx, .. }) if tx.len() == 2 => Some(tx),
+        _ => None,
+    });
+    assert_eq!((after[0].source, after[0].slot), (0, before[1].slot));
+    assert!(after[0].packets >= before[1].packets, "the stream was restarted");
+
+    // Another source takes over nothing of the one that is gone: not its
+    // slot, and so not its place.
+    dialer.configure(sent(vec![source("webcam", "Webcam", 1)]));
+    let settle = Instant::now() + Duration::from_secs(1);
+    wait_for(&listener_events, "the headset's output to close", |e| match e {
+        Event::Stats(stats) if stats.rx.iter().any(|rx| rx.format.channels == 1) => panic!("the webcam plays"),
+        Event::Stats(stats) => (Instant::now() > settle
+            && stats.rx.is_empty()
+            && named(&stats) == [("webcam".to_string(), "Webcam".to_string())])
+        .then_some(()),
+        _ => None,
+    });
+    let webcam = wait_for(&dialer_events, "the webcam to be sent", |e| match e {
+        Event::Stats(Stats { tx, .. }) if tx.len() == 1 => Some(tx[0]),
+        _ => None,
+    });
+    assert!(before.iter().all(|tx| tx.slot != webcam.slot));
+}
+
+#[test]
+fn a_peer_that_does_not_say_sends_its_default_sources() {
+    use soundbridge_core::protocol::{AudioHeader, CODEC_PCM16, Packet, decode};
+
+    // An end from before streams were identified, driven by hand: it sends
+    // a microphone in slot 0 and device audio in slot 1.
+    let old = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    old.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
+    let (listener, events) = engine(Config {
+        play: vec![SinkConfig { from: Streams::Source("system".into()), ..SinkConfig::new(SinkKind::Null) }],
+        ..config("listener")
+    });
+    let to = local(&listener);
+    old.send_to(&Packet::Hello { name: "old", caps: 0 }.to_vec(), to).unwrap();
+    let mut buf = [0u8; 2048];
+    let mut timestamp = 0u32;
+    let stats = loop {
+        if let Ok((n, _)) = old.recv_from(&mut buf)
+            && let Some(Packet::Ping { t_us, .. }) = decode(&buf[..n])
+        {
+            old.send_to(&Packet::Pong { t_us }.to_vec(), to).unwrap();
+        }
+        for (slot, kind, channels) in [(0, SourceKind::Mic, 1), (1, SourceKind::System, 2)] {
+            let header = AudioHeader { slot, kind, stream_id: 1, timestamp, sample_rate: 48_000, channels, codec: CODEC_PCM16 };
+            let payload = vec![0u8; 240 * 2 * channels as usize];
+            old.send_to(&Packet::Audio { header, payload: &payload }.to_vec(), to).unwrap();
+        }
+        timestamp += 240;
+        assert!(timestamp < 48_000 * 10, "nothing played");
+        let playing = events.try_iter().find_map(|e| match e {
+            Event::Stats(stats) if stats.rx.iter().any(|rx| rx.playing) => Some(stats),
+            _ => None,
+        });
+        if let Some(stats) = playing {
+            break stats;
+        }
+    };
+    assert_eq!(stats.rx.iter().map(|rx| (rx.slot, rx.kind)).collect::<Vec<_>>(), [(1, SourceKind::System)]);
+    assert_eq!(stats.remote_stream(1).map(|stream| stream.id.as_str()), Some("system"));
+}
+
+#[test]
+fn a_stream_named_by_source_goes_only_where_it_is_sent() {
     let null = |from| SinkConfig { from, ..SinkConfig::new(SinkKind::Null) };
+    let source = |id: &str| Streams::Source(id.into());
     let (listener, listener_events) = engine(Config {
         // Sinks 0 and 1 take the second stream away from sink 2, which is
         // left with the first; the third goes nowhere.
         play: vec![
-            null(Streams::Slot(1)),
-            null(Streams::Slot(1)),
+            null(source("b")),
+            null(source("b")),
             null(Streams::All),
-            SinkConfig { from: Streams::Slot(2), ..SinkConfig::new(SinkKind::Nothing) },
+            SinkConfig { from: source("c"), ..SinkConfig::new(SinkKind::Nothing) },
         ],
         ..config("listener")
     });
     let (dialer, dialer_events) = engine(Config {
-        send: vec![tone_source(1), tone_source(2), tone_source(1)],
+        send: lettered([tone_source(1), tone_source(2), tone_source(1)]),
         ..config("dialer")
     });
     dialer.connect(local(&listener));
@@ -290,10 +418,10 @@ fn the_receiving_end_sets_how_a_source_is_sent() {
     };
     // The sending end makes the change and hands it to its front end...
     let changed = wait_for(&dialer_events, "the change", |e| match e {
-        Event::SourceChanged(settings) => Some(settings),
+        Event::SourceChanged { source, settings } => Some((source, settings)),
         _ => None,
     });
-    assert_eq!(changed, wanted);
+    assert_eq!(changed, (0, wanted));
     let tx = wait_for(&dialer_events, "the stream to restart filtered", |e| match e {
         Event::Stats(Stats { tx, .. }) => tx.first().copied().filter(|tx| tx.denoise.is_on()),
         _ => None,
@@ -302,7 +430,7 @@ fn the_receiving_end_sets_how_a_source_is_sent() {
     // ...once, and the receiving end sees it done. The request it could not
     // have is dropped after a while.
     std::thread::sleep(Duration::from_millis(3500));
-    assert!(!dialer_events.try_iter().any(|e| matches!(e, Event::SourceChanged(_))), "changed again");
+    assert!(!dialer_events.try_iter().any(|e| matches!(e, Event::SourceChanged { .. })), "changed again");
     let latest = |events: &Receiver<Event>| {
         events.try_iter().filter_map(|e| match e {
             Event::Stats(stats) => Some(stats.remote_sources),

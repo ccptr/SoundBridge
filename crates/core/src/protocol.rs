@@ -20,6 +20,8 @@ pub const MAX_DATAGRAM: usize = 1400;
 /// Bytes in front of the samples in an audio packet.
 pub const AUDIO_HEADER_LEN: usize = 4 + 16;
 pub const MAX_NAME_LEN: usize = 64;
+/// Longest id of a stream: device ids run longer than names do.
+pub const MAX_ID_LEN: usize = 255;
 /// Most streams one end sends at once. Bounds what a peer can make this end
 /// open, and lets every stream's report fit in one ping.
 pub const MAX_STREAMS: usize = 64;
@@ -34,6 +36,7 @@ const T_PONG: u8 = 7;
 const T_AUDIO: u8 = 8;
 const T_SOURCES: u8 = 9;
 const T_SET: u8 = 10;
+const T_STREAM: u8 = 11;
 
 /// Signed 16-bit little-endian PCM, interleaved. The only codec so far; the
 /// field exists so a compressed one can be added without a version bump.
@@ -41,6 +44,8 @@ pub const CODEC_PCM16: u8 = 0;
 
 pub const CAP_SENDS: u8 = 1;
 pub const CAP_PLAYS: u8 = 2;
+/// Says which source each of its streams comes from ([`Packet::Stream`]).
+pub const CAP_IDENTIFIES: u8 = 4;
 
 pub const BYE_NORMAL: u8 = 0;
 pub const BYE_BUSY: u8 = 1;
@@ -66,8 +71,8 @@ pub struct Report {
 pub struct SourceSettings {
     /// The sender's slot of the stream.
     pub slot: u8,
-    /// What is in that slot. A request made for another kind of source than
-    /// the one now there is for a stream that has gone, and is ignored.
+    /// What that stream carries. A request made for another kind of source
+    /// than the one now there is for a stream that has gone, and is ignored.
     pub kind: SourceKind,
     pub denoise: Mode,
     pub auto_gain: bool,
@@ -76,7 +81,9 @@ pub struct SourceSettings {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudioHeader {
-    /// Which of the sender's streams this is; stable while its source is.
+    /// Which of the sender's streams this is, below [`MAX_STREAMS`]. It
+    /// stays with the source for as long as that is sent, and says nothing
+    /// else about it: [`Packet::Stream`] says which source it is.
     pub slot: u8,
     /// What the stream carries, so the receiver can decide where it goes.
     pub kind: SourceKind,
@@ -100,12 +107,19 @@ pub enum Packet<'a> {
     Ping { t_us: u64, reports: Vec<Report> },
     Pong { t_us: u64 },
     Audio { header: AudioHeader, payload: &'a [u8] },
-    /// Everything the sender of this packet sends, in slot order and at most
-    /// [`MAX_STREAMS`]. Goes out with every ping and whenever it changes.
+    /// Everything the sender of this packet sends, at most [`MAX_STREAMS`].
+    /// Goes out with every ping and whenever it changes.
     Sources { sources: Vec<SourceSettings> },
     /// Asks the peer to send one of its sources this way from now on. The
     /// answer is its next [`Packet::Sources`].
     Set { source: SourceSettings },
+    /// Which source the stream in `slot` comes from: `id` is what the sender
+    /// knows that source by for good, and is what the receiver gives the
+    /// stream its place by; `name` is what to show for it, and may change.
+    /// One goes out for each stream alongside [`Packet::Sources`], which
+    /// could not hold them all in one datagram. An end from before streams
+    /// were identified ignores it.
+    Stream { slot: u8, id: &'a str, name: &'a str },
 }
 
 fn head(out: &mut Vec<u8>, kind: u8) {
@@ -116,7 +130,12 @@ fn head(out: &mut Vec<u8>, kind: u8) {
 }
 
 fn put_name(out: &mut Vec<u8>, name: &str) {
-    let mut end = name.len().min(MAX_NAME_LEN);
+    put_text(out, name, MAX_NAME_LEN);
+}
+
+/// The text cut to `max` bytes, with its length in front.
+fn put_text(out: &mut Vec<u8>, name: &str, max: usize) {
+    let mut end = name.len().min(max);
     while !name.is_char_boundary(end) {
         end -= 1;
     }
@@ -218,6 +237,12 @@ impl Packet<'_> {
                 head(out, T_SET);
                 put_source(out, source);
             }
+            Packet::Stream { slot, id, name } => {
+                head(out, T_STREAM);
+                out.push(slot);
+                put_text(out, id, MAX_ID_LEN);
+                put_name(out, name);
+            }
         }
     }
 
@@ -284,8 +309,11 @@ impl<'a> Reader<'a> {
         Some(SourceSettings { slot, kind, denoise, auto_gain: self.u8()? != 0, gain_db: self.f32()? })
     }
     fn name(&mut self) -> Option<&'a str> {
+        self.text(MAX_NAME_LEN)
+    }
+    fn text(&mut self, max: usize) -> Option<&'a str> {
         let len = self.u8()? as usize;
-        if len > MAX_NAME_LEN {
+        if len > max {
             return None;
         }
         std::str::from_utf8(self.take(len)?).ok()
@@ -366,6 +394,13 @@ pub fn decode(buf: &[u8]) -> Option<Packet<'_>> {
             Packet::Sources { sources }
         }
         T_SET => Packet::Set { source: r.source()? },
+        T_STREAM => {
+            let slot = r.u8()?;
+            if slot as usize >= MAX_STREAMS {
+                return None;
+            }
+            Packet::Stream { slot, id: r.text(MAX_ID_LEN)?, name: r.name()? }
+        }
         _ => return None,
     })
 }
@@ -414,6 +449,8 @@ mod tests {
         roundtrip(Packet::Sources { sources: Vec::new() });
         roundtrip(Packet::Sources { sources: vec![mic, system, SourceSettings { denoise: Mode::Reduce, ..mic }] });
         roundtrip(Packet::Set { source: mic });
+        roundtrip(Packet::Stream { slot: 63, id: "pipewire:alsa_input.usb-headset", name: "Headset" });
+        roundtrip(Packet::Stream { slot: 0, id: &"i".repeat(MAX_ID_LEN), name: "" });
     }
 
     #[test]
@@ -461,6 +498,8 @@ mod tests {
             set[at] = bad;
             assert_eq!(decode(&set), None);
         }
+        // A source for a stream there cannot be.
+        assert_eq!(decode(&Packet::Stream { slot: MAX_STREAMS as u8, id: "mic", name: "x" }.to_vec()), None);
     }
 
     #[test]

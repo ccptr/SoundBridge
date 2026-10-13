@@ -4,7 +4,6 @@
 use std::path::PathBuf;
 
 use soundbridge_core::denoise::Mode;
-use soundbridge_core::protocol::MAX_STREAMS;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Kind {
@@ -16,6 +15,9 @@ pub enum Kind {
 /// One stream this PC sends.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Source {
+    /// What the other device is told to show the stream as. Empty for the
+    /// name of the device it comes from.
+    pub name: String,
     pub kind: Kind,
     /// Device id; `None` follows the system default.
     pub device: Option<String>,
@@ -46,16 +48,19 @@ pub struct Route {
 /// Where one of the other device's streams goes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StreamRoute {
-    /// Which stream, counted from 0 in the order the other device sends them.
-    pub slot: u8,
+    /// Which stream: the id the other device knows its source by.
+    pub source: String,
+    /// What the other device last called it, for when it is not there to say.
+    pub name: String,
     pub route: Route,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
     pub sources: Vec<Source>,
-    /// Where the other device's streams are played. One listed twice plays
-    /// in both places, and one that is not listed on the default speakers.
+    /// Where the other device's streams are played, each listed once at
+    /// most. One that is not listed plays on the default output, so none is
+    /// listed for that.
     pub play_streams: Vec<StreamRoute>,
     /// Fixed jitter buffer in ms, or `None` for automatic.
     pub buffer_ms: Option<u32>,
@@ -122,21 +127,43 @@ impl Settings {
                     let auto_gain = flags.next() == Some("1");
                     let gain_db = flags.next().and_then(|db| db.parse().ok()).unwrap_or(0);
                     let device = fields.next().and_then(device);
-                    s.sources.push(Source { kind, device, denoise, auto_gain, gain_db });
+                    s.sources.push(Source { name: String::new(), kind, device, denoise, auto_gain, gain_db });
                 }
-                // number|play|device, the number counted from 1 as it is shown.
-                "play_stream" => {
-                    let mut fields = value.splitn(3, '|');
-                    let number = fields.next().and_then(|n| n.parse::<usize>().ok());
-                    let Some(slot) = number.filter(|n| (1..=MAX_STREAMS).contains(n)) else { continue };
-                    let route = Route { play: play(fields.next().unwrap_or_default()), device: fields.next().and_then(device) };
-                    s.play_streams.push(StreamRoute { slot: slot as u8 - 1, route });
+                // Of the source on the line before.
+                "source_name" => {
+                    if let Some(source) = s.sources.last_mut() {
+                        source.name = value.to_string();
+                    }
+                }
+                // A stream's source, which may hold anything, with where it
+                // plays on the lines after it.
+                "route" => {
+                    if !value.is_empty() {
+                        let route = Route { play: Play::Off, device: None };
+                        s.play_streams.push(StreamRoute { source: value.to_string(), name: String::new(), route });
+                    }
+                }
+                "route_play" | "route_device" | "route_name" => {
+                    let Some(stream) = s.play_streams.last_mut() else { continue };
+                    match key {
+                        "route_play" => stream.route.play = play(value),
+                        "route_device" => stream.route.device = device(value),
+                        _ => stream.name = value.to_string(),
+                    }
                 }
                 "buffer_ms" => s.buffer_ms = value.parse().ok(),
                 "host" => s.host = value.to_string(),
                 _ => {}
             }
         }
+        // Each stream once, and none for where it would play anyway.
+        let mut listed: Vec<StreamRoute> = Vec::new();
+        for stream in s.play_streams.drain(..) {
+            if stream.route != Route::default() && listed.iter().all(|listed| listed.source != stream.source) {
+                listed.push(stream);
+            }
+        }
+        s.play_streams = listed;
         s
     }
 
@@ -147,6 +174,8 @@ impl Settings {
             Play::VirtualMic => "virtual-mic",
         };
         let device = |d: &Option<String>| d.clone().unwrap_or_default();
+        // What comes from the other device may hold anything.
+        let line = |text: &str| text.replace(['\n', '\r'], " ");
         let mut out = String::new();
         for source in &self.sources {
             let kind = match source.kind {
@@ -160,10 +189,19 @@ impl Settings {
                 source.gain_db,
                 device(&source.device)
             );
+            if !source.name.is_empty() {
+                out += &format!("source_name={}\n", line(&source.name));
+            }
         }
         for stream in &self.play_streams {
             let route = &stream.route;
-            out += &format!("play_stream={}|{}|{}\n", stream.slot as usize + 1, play(route.play), device(&route.device));
+            out += &format!(
+                "route={}\nroute_play={}\nroute_device={}\nroute_name={}\n",
+                line(&stream.source),
+                play(route.play),
+                device(&route.device),
+                line(&stream.name)
+            );
         }
         out + &format!(
             "buffer_ms={}\nhost={}\n",
@@ -182,7 +220,14 @@ mod tests {
     fn round_trips() {
         let settings = Settings {
             sources: vec![
-                Source { kind: Kind::Mic, denoise: Mode::Reduce, auto_gain: true, gain_db: -6, ..Source::default() },
+                Source {
+                    name: "Headset | left=1".into(),
+                    kind: Kind::Mic,
+                    denoise: Mode::Reduce,
+                    auto_gain: true,
+                    gain_db: -6,
+                    ..Source::default()
+                },
                 Source {
                     kind: Kind::Mic,
                     denoise: Mode::Gate(Gate { lookahead_ms: 80, hold_ms: 500, threshold: 0.3 }),
@@ -201,10 +246,13 @@ mod tests {
                 },
             ],
             play_streams: vec![
-                StreamRoute { slot: 1, route: Route { play: Play::Speaker, device: Some("pipewire:a|b".into()) } },
-                StreamRoute { slot: 1, route: Route::default() },
-                StreamRoute { slot: 0, route: Route { play: Play::VirtualMic, device: None } },
-                StreamRoute { slot: 63, route: Route { play: Play::Off, device: None } },
+                StreamRoute {
+                    source: "pipewire:alsa_input.usb={a|b}".into(),
+                    name: "Phone | mic=1".into(),
+                    route: Route { play: Play::Speaker, device: Some("pipewire:a|b".into()) },
+                },
+                StreamRoute { source: "mic".into(), name: String::new(), route: Route { play: Play::VirtualMic, device: None } },
+                StreamRoute { source: "system".into(), name: "Far".into(), route: Route { play: Play::Off, device: None } },
             ],
             buffer_ms: Some(10),
             host: "192.168.1.20:47800".into(),
@@ -234,15 +282,22 @@ mod tests {
 
     #[test]
     fn tolerates_junk() {
-        let junk = "nonsense\nsource=loud\nsend=mic\nbuffer_ms=soon\nplay_stream=0|off|\nplay_stream=x\n";
+        let junk = "nonsense\nsource=loud\nsend=mic\nbuffer_ms=soon\nroute=\nroute_play=off\nsource_name=x\n";
         assert_eq!(Settings::parse(junk), Settings::default());
     }
 
     #[test]
-    fn drops_where_each_kind_was_played() {
-        // From when streams were routed by what they carry, which says
-        // nothing about their numbers.
-        let s = Settings::parse("play_mic=virtual-mic\nplay_system=off\nplay_system_device=x\nhost=pc\n");
+    fn lists_a_stream_once_and_not_for_the_default_output() {
+        let saved = "route=system\nroute_play=speaker\nroute=mic\nroute_play=virtual-mic\nroute_name=Phone\n\
+                     route=mic\nroute_play=off\n";
+        let route = Route { play: Play::VirtualMic, device: None };
+        assert_eq!(Settings::parse(saved).play_streams, [StreamRoute { source: "mic".into(), name: "Phone".into(), route }]);
+    }
+
+    #[test]
+    fn drops_where_streams_were_played_by_kind_or_by_number() {
+        // Neither says which source a stream comes from.
+        let s = Settings::parse("play_mic=virtual-mic\nplay_system=off\nplay_stream=1|off|\nhost=pc\n");
         assert_eq!(s, Settings { host: "pc".into(), ..Settings::default() });
     }
 }
