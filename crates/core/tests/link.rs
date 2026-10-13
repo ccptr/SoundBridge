@@ -10,7 +10,7 @@ use soundbridge_core::audio::{MakeCapture, MakeRender};
 use soundbridge_core::denoise;
 use soundbridge_core::{
     AudioBackend, CaptureRequest, Config, DeviceInfo, Engine, Event, PlaybackRequest, SinkConfig,
-    SinkKind, SourceConfig, SourceKind, State, Stats, StreamHandle, Streams,
+    SinkKind, SourceConfig, SourceKind, SourceSettings, State, Stats, StreamHandle, Streams,
 };
 
 /// The synthetic source and sink live in the engine; nothing here should
@@ -258,6 +258,70 @@ fn a_filtered_source_is_sent_as_mono_speech() {
     wait_for(&listener_events, "playback", |e| match e {
         Event::Stats(Stats { rx, .. }) => rx.first().filter(|rx| rx.playing).map(|_| ()),
         Event::Error(e) => panic!("{e}"),
+        _ => None,
+    });
+}
+
+#[test]
+fn the_receiving_end_sets_how_a_source_is_sent() {
+    let (listener, listener_events) =
+        engine(Config { play: vec![SinkConfig::new(SinkKind::Null)], ..config("listener") });
+    let system = SourceConfig::new(SourceKind::System);
+    let sent = |tone| Config { send: vec![tone, system.clone()], ..config("dialer") };
+    let (dialer, dialer_events) = engine(sent(SourceConfig { auto_gain: true, ..tone_source(1) }));
+    dialer.connect(local(&listener));
+
+    // The receiving end is told what is sent and how, whether it opens or not.
+    let sources = wait_for(&listener_events, "the peer's sources", |e| match e {
+        Event::Stats(Stats { remote_sources, .. }) if !remote_sources.is_empty() => Some(remote_sources),
+        _ => None,
+    });
+    let tone =
+        SourceSettings { slot: 0, kind: SourceKind::Tone, denoise: denoise::Mode::Off, auto_gain: true, gain_db: 0.0 };
+    let device = SourceSettings { slot: 1, kind: SourceKind::System, auto_gain: false, ..tone };
+    assert_eq!(sources, [tone, device]);
+
+    // It asks for the tone filtered and louder, beyond what there is of either.
+    let gate = denoise::Gate { lookahead_ms: 85, hold_ms: 400, threshold: 0.4 };
+    listener.set_remote(SourceSettings { denoise: denoise::Mode::Gate(gate), auto_gain: false, gain_db: 90.0, ..tone });
+    // Not to be had: device audio is sent as it is, and there is no third stream.
+    listener.set_remote(SourceSettings { gain_db: 6.0, ..device });
+    listener.set_remote(SourceSettings { slot: 2, ..tone });
+    let wanted = SourceSettings {
+        denoise: denoise::Mode::Gate(denoise::Gate { lookahead_ms: 80, ..gate }),
+        auto_gain: false,
+        gain_db: 40.0,
+        ..tone
+    };
+    // The sending end makes the change and hands it to its front end...
+    let changed = wait_for(&dialer_events, "the change", |e| match e {
+        Event::SourceChanged(settings) => Some(settings),
+        _ => None,
+    });
+    assert_eq!(changed, wanted);
+    let tx = wait_for(&dialer_events, "the stream to restart filtered", |e| match e {
+        Event::Stats(Stats { tx, .. }) => tx.first().copied().filter(|tx| tx.denoise.is_on()),
+        _ => None,
+    });
+    assert_eq!((tx.denoise, tx.format.channels), (wanted.denoise, 1));
+    // ...once, and the receiving end sees it done. The request it could not
+    // have is dropped after a while.
+    std::thread::sleep(Duration::from_millis(3500));
+    assert!(!dialer_events.try_iter().any(|e| matches!(e, Event::SourceChanged(_))), "changed again");
+    let latest = |events: &Receiver<Event>| {
+        events.try_iter().filter_map(|e| match e {
+            Event::Stats(stats) => Some(stats.remote_sources),
+            _ => None,
+        })
+        .last()
+    };
+    assert_eq!(latest(&listener_events).unwrap(), [wanted, device]);
+
+    // What the sending end is set to afterwards is what counts, and is told.
+    dialer.configure(sent(tone_source(1)));
+    wait_for(&listener_events, "the sender's own change", |e| match e {
+        Event::Stats(Stats { remote_sources, .. }) => (remote_sources[0] == SourceSettings { auto_gain: false, ..tone })
+            .then_some(()),
         _ => None,
     });
 }

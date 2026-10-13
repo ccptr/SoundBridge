@@ -40,6 +40,7 @@ soundbridge listen --play mic:virtual-mic --play system:speaker   # each kind of
 soundbridge listen --play 2:speaker=ID --play speaker            # the second stream on a device of its own
 soundbridge connect HOST --send mic --send system --denoise      # two streams; the mic voice only
 soundbridge connect HOST --send mic --denoise=whole              # voice only, keeping the start of every word
+soundbridge listen --play virtual-mic --remote denoise=whole     # the same, set from the end that hears it
 soundbridge listen --play null                 # link test without sound:
 soundbridge connect HOST --send tone --play none
 ```
@@ -114,6 +115,38 @@ quieter, or is the whole gain when the automatic one is off. With either, a
 limiter keeps the stream from clipping. It runs on the sending end, before
 the audio is reduced to 16 bits, and adds no delay.
 
+### Setting a microphone from the other end
+
+Filtering and levelling happen where the microphone is, but it is the other
+end that hears the result, and the phone that is the microphone is usually
+not the device in front of you. So each end tells the other what it sends
+and how each microphone is set, and either end can change those settings:
+
+- The desktop and Android apps show "The other device's microphone" while
+  connected, with the same choices as for a microphone of their own: what is
+  filtered out, the gate's tuning, automatic level and gain.
+- On the command line, `--remote SETTING=VALUE` sets the microphones the peer
+  sends: `denoise=MODE` (`off`, `reduce`, `voice`, `whole`, or
+  `gate:LOOKAHEAD:HOLD:THRESHOLD` for a tuning of the gate),
+  `auto-gain=on|off` or `gain=DB`. A number in front is for one stream only.
+  What is not mentioned stays as the peer has it.
+
+```sh
+soundbridge listen --play virtual-mic --remote denoise=voice --remote gain=6
+soundbridge listen --play speaker --remote 2:denoise=gate:80:400:0.4 --remote 2:auto-gain=on
+```
+
+- The change is made on the sending device, as if it had been chosen there:
+  its app shows it and keeps it for next time. Whichever end sets something
+  last wins.
+- The command line asks once for each stream, when it first sees it. What is
+  changed on the sending device after that stands.
+- Only microphones can be set this way. Which sources are sent, and from
+  which devices, is still decided by the sending end alone.
+- The stream restarts with the new setting, which is a moment of silence.
+- An end running a release from before this neither says how it is set nor
+  takes requests; the choices are just not offered for it.
+
 ### Updates
 
 The programs in a release's Linux and Windows archives keep themselves
@@ -184,6 +217,8 @@ of milliseconds of its own.
 - **No encryption or authentication.** Audio crosses the network in the
   clear, and a listening instance accepts the first peer that connects. Use
   it on networks you trust.
+- For the same reason, whoever is connected can change how this end's
+  microphones are filtered and levelled (see above). It cannot be turned off.
 - One peer at a time: any number of streams, but all with the same device.
 - Both ends must run the same protocol version. This one (2, the first with
   several streams) does not talk to version 1; an old and a new end just

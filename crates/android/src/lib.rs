@@ -19,7 +19,7 @@ use jni::sys::{jboolean, jfloat, jint, jlong};
 use soundbridge_core::denoise::{Gate, Mode};
 use soundbridge_core::{
     BufferMode, Config, DEFAULT_PORT, Engine, Event, SinkConfig, SinkKind, SourceConfig,
-    SourceKind, State,
+    SourceKind, SourceSettings, State,
 };
 
 /// The `denoise` argument; anything else is off.
@@ -124,6 +124,26 @@ fn kind_name(kind: SourceKind) -> &'static str {
     }
 }
 
+/// How a source is set, in the terms of the app's `MicSettings`. The gate's
+/// tuning is there only while the gate is on.
+fn source_json(o: &mut String, source: &SourceSettings) {
+    let _ = write!(o, r#""slot":{},"kind":"{}","denoise":"#, source.slot, kind_name(source.kind));
+    match source.denoise {
+        Mode::Off => o.push_str(r#""off""#),
+        Mode::Reduce => o.push_str(r#""reduce""#),
+        Mode::Gate(gate) => {
+            let _ = write!(
+                o,
+                r#""gate","lookahead":{},"hold":{},"threshold":{}"#,
+                gate.lookahead_ms,
+                gate.hold_ms,
+                num(gate.threshold)
+            );
+        }
+    }
+    let _ = write!(o, r#","autoGain":{},"gainDb":{}"#, source.auto_gain, num(source.gain_db).round() as i32);
+}
+
 fn event_json(event: &Event) -> String {
     let mut o = String::with_capacity(256);
     match event {
@@ -204,7 +224,17 @@ fn event_json(event: &Event) -> String {
                     rx.underruns
                 );
             }
-            o.push(']');
+            o.push_str(r#"],"sources":["#);
+            for (i, source) in stats.remote_sources.iter().enumerate() {
+                o.push_str(if i > 0 { ",{" } else { "{" });
+                source_json(&mut o, source);
+                o.push('}');
+            }
+            o.push_str("]}");
+        }
+        Event::SourceChanged(source) => {
+            o.push_str(r#"{"type":"source","#);
+            source_json(&mut o, source);
             o.push('}');
         }
         Event::Info(text) | Event::Error(text) => {
@@ -330,6 +360,32 @@ pub extern "system" fn Java_dev_ccptr_soundbridge_Native_connect<'l>(
             1
         }
         _ => 0,
+    }
+}
+
+/// Asks the other device to filter and level the microphone it sends in
+/// `slot` this way; the arguments are those `start` takes for our own.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_ccptr_soundbridge_Native_setRemoteMic(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    slot: jint,
+    denoise: jint,
+    gate_lookahead_ms: jint,
+    gate_hold_ms: jint,
+    gate_threshold: jfloat,
+    auto_gain: jboolean,
+    gain_db: jint,
+) {
+    if let (Some(engine), Ok(slot)) = (engine(handle), u8::try_from(slot)) {
+        engine.set_remote(SourceSettings {
+            slot,
+            kind: SourceKind::Mic,
+            denoise: denoise_mode(denoise, gate_lookahead_ms, gate_hold_ms, gate_threshold),
+            auto_gain: auto_gain != 0,
+            gain_db: gain_db as f32,
+        });
     }
 }
 

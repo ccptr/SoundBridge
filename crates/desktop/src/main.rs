@@ -20,7 +20,7 @@ use soundbridge_core::cpal_backend::CpalBackend;
 use soundbridge_core::denoise::{Gate, Mode};
 use soundbridge_core::{
     AudioBackend, BufferMode, Config, DEFAULT_PORT, DeviceDirection, DeviceInfo, Engine, Event,
-    Peer, SinkConfig, SinkKind, SourceConfig, SourceKind, State, Stats, Streams,
+    Peer, SinkConfig, SinkKind, SourceConfig, SourceKind, SourceSettings, State, Stats, Streams,
 };
 use soundbridge_core::protocol::MAX_STREAMS;
 
@@ -54,6 +54,22 @@ enum Picker {
     Source(usize),
     Sink(Kind),
     Stream(usize),
+}
+
+/// Whose microphone a set of controls is for: one this PC sends, by its place
+/// in the list, or one the other device sends, by its slot there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mic {
+    Local(usize),
+    Remote(u8),
+}
+
+/// What those controls set.
+#[derive(Clone, Copy, PartialEq)]
+struct Tuning {
+    denoise: Mode,
+    auto_gain: bool,
+    gain_db: i32,
 }
 
 /// How far a look for a new release, asked for by hand, has got.
@@ -192,6 +208,21 @@ impl Bridge {
             }
             Event::Stats(stats) => self.stats = stats,
             Event::Peers(peers) => self.peers = peers,
+            Event::SourceChanged(changed) => {
+                let source = self.settings.sources.get_mut(changed.slot as usize);
+                let Some(source) = source.filter(|source| wire_kind(source.kind) == changed.kind) else { return };
+                source.denoise = changed.denoise;
+                source.auto_gain = changed.auto_gain;
+                source.gain_db = changed.gain_db.round() as i32;
+                let from = match &self.state {
+                    State::Connected { name, .. } => name.as_str(),
+                    _ => "the other device",
+                };
+                let text = format!("Stream {} was set from {from}", changed.slot + 1).into();
+                self.notice = Some(Notice { text, error: false });
+                // Saved, and handed back to the engine in case the gain was rounded.
+                self.settings_changed(cx);
+            }
             Event::Info(text) => self.notice = Some(Notice { text: text.into(), error: false }),
             Event::Error(text) => self.notice = Some(Notice { text: text.into(), error: true }),
         }
@@ -217,6 +248,41 @@ impl Bridge {
             engine.configure(config(&self.settings));
         }
         cx.notify();
+    }
+
+    /// Changes how a microphone is filtered or levelled: in the settings for
+    /// one of ours, by asking the other device for one of its own.
+    fn tune(&mut self, mic: Mic, change: impl FnOnce(&mut Tuning), cx: &mut Context<Self>) {
+        self.open_picker = None;
+        match mic {
+            Mic::Local(index) => {
+                if let Some(source) = self.settings.sources.get_mut(index) {
+                    let mut tuning =
+                        Tuning { denoise: source.denoise, auto_gain: source.auto_gain, gain_db: source.gain_db };
+                    change(&mut tuning);
+                    (source.denoise, source.auto_gain, source.gain_db) =
+                        (tuning.denoise, tuning.auto_gain, tuning.gain_db);
+                }
+                self.settings_changed(cx);
+            }
+            Mic::Remote(slot) => {
+                // Changed in what is shown as well, which the engine's next
+                // report confirms or takes back.
+                let Some(source) = self.stats.remote_sources.iter_mut().find(|s| s.slot == slot) else { return };
+                let before = remote_tuning(source);
+                let mut tuning = before;
+                change(&mut tuning);
+                (source.denoise, source.auto_gain) = (tuning.denoise, tuning.auto_gain);
+                // A gain between two whole numbers stays unless it is the gain that changed.
+                if tuning.gain_db != before.gain_db {
+                    source.gain_db = tuning.gain_db as f32;
+                }
+                if let Some(engine) = &self.engine {
+                    engine.set_remote(*source);
+                }
+                cx.notify();
+            }
+        }
     }
 
     fn connect(&mut self, addr: SocketAddr, cx: &mut Context<Self>) {
@@ -365,6 +431,10 @@ fn config(settings: &Settings) -> Config {
         },
         ..Config::default()
     }
+}
+
+fn remote_tuning(source: &SourceSettings) -> Tuning {
+    Tuning { denoise: source.denoise, auto_gain: source.auto_gain, gain_db: source.gain_db.round() as i32 }
 }
 
 fn wire_kind(kind: Kind) -> SourceKind {
@@ -636,108 +706,9 @@ impl Bridge {
                 .child(self.device_picker(Picker::Source(index), &source.device, direction, cx));
             block = match source.kind {
                 Kind::Mic => {
-                    let pick = cx.listener(move |this, &mode: &Mode, _, cx| {
-                        if let Some(source) = this.settings.sources.get_mut(index) {
-                            source.denoise = mode;
-                        }
-                        this.open_picker = None;
-                        this.settings_changed(cx);
-                    });
-                    let block = block.child(segmented(("denoise", index), &DENOISE_CHOICES, source.denoise, pick));
-                    let delay = source.denoise.delay_ms();
-                    let block = match source.denoise {
-                        Mode::Off => block,
-                        Mode::Reduce => block.child(detail(format!(
-                            "Background noise is taken out from under the voice and nothing is cut off. \
-                             Typing and clicks still come through in part. Adds about {delay} ms of delay."
-                        ))),
-                        Mode::Gate(gate) => {
-                            // Each row changes one thing about the gate.
-                            let tune = |id: &'static str,
-                                        options: &[(f32, &'static str)],
-                                        current: f32,
-                                        set: fn(&mut Gate, f32),
-                                        cx: &mut Context<Self>| {
-                                let pick = cx.listener(move |this, &value: &f32, _, cx| {
-                                    if let Some(Source { denoise: Mode::Gate(gate), .. }) =
-                                        this.settings.sources.get_mut(index)
-                                    {
-                                        set(gate, value);
-                                    }
-                                    this.open_picker = None;
-                                    this.settings_changed(cx);
-                                });
-                                segmented((id, index), options, current, pick)
-                            };
-                            let ms = |choices: &[(u32, &'static str)]| -> Vec<(f32, &'static str)> {
-                                choices.iter().map(|&(ms, label)| (ms as f32, label)).collect()
-                            };
-                            let tuned = !DENOISE_CHOICES.iter().any(|&(mode, _)| mode == source.denoise);
-                            block
-                                .child(detail(format!(
-                                    "{}Typing, mouse clicks, breathing and background noise are removed. \
-                                     Adds about {delay} ms of delay.",
-                                    if tuned { "Your own tuning. " } else { "" }
-                                )))
-                                .child(tune(
-                                    "gate-lookahead",
-                                    &ms(&LOOKAHEAD_CHOICES),
-                                    gate.lookahead_ms as f32,
-                                    |gate, ms| gate.lookahead_ms = ms as u32,
-                                    cx,
-                                ))
-                                .child(detail(
-                                    "How far it listens ahead. More keeps the start of a word after a pause, \
-                                     and delays the voice as much.",
-                                ))
-                                .child(tune(
-                                    "gate-hold",
-                                    &ms(&HOLD_CHOICES),
-                                    gate.hold_ms as f32,
-                                    |gate, ms| gate.hold_ms = ms as u32,
-                                    cx,
-                                ))
-                                .child(detail(
-                                    "How long it stays open after the voice stops. More bridges longer gaps, \
-                                     and lets more noise trail a phrase.",
-                                ))
-                                .child(tune(
-                                    "gate-threshold",
-                                    &THRESHOLD_CHOICES,
-                                    gate.threshold,
-                                    |gate, level| gate.threshold = level,
-                                    cx,
-                                ))
-                                .child(detail(
-                                    "How sure it must be that it hears a voice. Lenient opens for quiet speech, \
-                                     and for more that is not speech.",
-                                ))
-                        }
-                    };
-                    let options = [(false, "Level as it is"), (true, "Automatic level")];
-                    let pick = cx.listener(move |this, &auto_gain: &bool, _, cx| {
-                        if let Some(source) = this.settings.sources.get_mut(index) {
-                            source.auto_gain = auto_gain;
-                        }
-                        this.open_picker = None;
-                        this.settings_changed(cx);
-                    });
-                    let block = block.child(segmented(("auto-gain", index), &options, source.auto_gain, pick));
-                    let pick = cx.listener(move |this, &gain_db: &i32, _, cx| {
-                        if let Some(source) = this.settings.sources.get_mut(index) {
-                            source.gain_db = gain_db;
-                        }
-                        this.open_picker = None;
-                        this.settings_changed(cx);
-                    });
-                    block.child(segmented(("gain", index), &GAIN_CHOICES, source.gain_db, pick)).child(detail(
-                        match (source.auto_gain, source.gain_db) {
-                            (true, 0) => "Speech is brought to a steady level, however quiet the microphone is.",
-                            (true, _) => "Speech is brought to a steady level, then louder or quieter by this much.",
-                            (false, 0) => "Sent as loud as the microphone delivers it.",
-                            (false, _) => "Louder or quieter by this much. A limiter keeps it from clipping.",
-                        },
-                    ))
+                    let tuning =
+                        Tuning { denoise: source.denoise, auto_gain: source.auto_gain, gain_db: source.gain_db };
+                    self.mic_controls(block, Mic::Local(index), tuning, cx)
                 }
                 Kind::System => block.child(detail("Sends whatever is playing on that output.")),
             };
@@ -757,6 +728,118 @@ impl Bridge {
                 .child(add("add-mic", "Add microphone", Kind::Mic, cx))
                 .child(add("add-system", "Add PC audio", Kind::System, cx)),
         )
+    }
+
+    /// Adds to `block` the choices of how a microphone is filtered and levelled.
+    fn mic_controls(&self, block: Div, mic: Mic, tuning: Tuning, cx: &mut Context<Self>) -> Div {
+        let id = |name: &'static str, remote: &'static str| -> ElementId {
+            match mic {
+                Mic::Local(index) => (name, index).into(),
+                Mic::Remote(slot) => (remote, slot as usize).into(),
+            }
+        };
+        let pick = cx.listener(move |this, &mode: &Mode, _, cx| this.tune(mic, |tuning| tuning.denoise = mode, cx));
+        let block = block.child(segmented(id("denoise", "remote-denoise"), &DENOISE_CHOICES, tuning.denoise, pick));
+        let delay = tuning.denoise.delay_ms();
+        let block = match tuning.denoise {
+            Mode::Off => block,
+            Mode::Reduce => block.child(detail(format!(
+                "Background noise is taken out from under the voice and nothing is cut off. \
+                 Typing and clicks still come through in part. Adds about {delay} ms of delay."
+            ))),
+            Mode::Gate(gate) => {
+                // Each row changes one thing about the gate.
+                let tune = |id: ElementId,
+                            options: &[(f32, &'static str)],
+                            current: f32,
+                            set: fn(&mut Gate, f32),
+                            cx: &mut Context<Self>| {
+                    let pick = cx.listener(move |this, &value: &f32, _, cx| {
+                        let change = |tuning: &mut Tuning| {
+                            if let Mode::Gate(gate) = &mut tuning.denoise {
+                                set(gate, value);
+                            }
+                        };
+                        this.tune(mic, change, cx);
+                    });
+                    segmented(id, options, current, pick)
+                };
+                let ms = |choices: &[(u32, &'static str)]| -> Vec<(f32, &'static str)> {
+                    choices.iter().map(|&(ms, label)| (ms as f32, label)).collect()
+                };
+                let tuned = !DENOISE_CHOICES.iter().any(|&(mode, _)| mode == tuning.denoise);
+                block
+                    .child(detail(format!(
+                        "{}Typing, mouse clicks, breathing and background noise are removed. \
+                         Adds about {delay} ms of delay.",
+                        if tuned { "Your own tuning. " } else { "" }
+                    )))
+                    .child(tune(
+                        id("gate-lookahead", "remote-gate-lookahead"),
+                        &ms(&LOOKAHEAD_CHOICES),
+                        gate.lookahead_ms as f32,
+                        |gate, ms| gate.lookahead_ms = ms as u32,
+                        cx,
+                    ))
+                    .child(detail(
+                        "How far it listens ahead. More keeps the start of a word after a pause, \
+                         and delays the voice as much.",
+                    ))
+                    .child(tune(
+                        id("gate-hold", "remote-gate-hold"),
+                        &ms(&HOLD_CHOICES),
+                        gate.hold_ms as f32,
+                        |gate, ms| gate.hold_ms = ms as u32,
+                        cx,
+                    ))
+                    .child(detail(
+                        "How long it stays open after the voice stops. More bridges longer gaps, \
+                         and lets more noise trail a phrase.",
+                    ))
+                    .child(tune(
+                        id("gate-threshold", "remote-gate-threshold"),
+                        &THRESHOLD_CHOICES,
+                        gate.threshold,
+                        |gate, level| gate.threshold = level,
+                        cx,
+                    ))
+                    .child(detail(
+                        "How sure it must be that it hears a voice. Lenient opens for quiet speech, \
+                         and for more that is not speech.",
+                    ))
+            }
+        };
+        let options = [(false, "Level as it is"), (true, "Automatic level")];
+        let pick =
+            cx.listener(move |this, &auto_gain: &bool, _, cx| this.tune(mic, |tuning| tuning.auto_gain = auto_gain, cx));
+        let block = block.child(segmented(id("auto-gain", "remote-auto-gain"), &options, tuning.auto_gain, pick));
+        let pick = cx.listener(move |this, &gain_db: &i32, _, cx| this.tune(mic, |tuning| tuning.gain_db = gain_db, cx));
+        block.child(segmented(id("gain", "remote-gain"), &GAIN_CHOICES, tuning.gain_db, pick)).child(detail(
+            match (tuning.auto_gain, tuning.gain_db) {
+                (true, 0) => "Speech is brought to a steady level, however quiet the microphone is.",
+                (true, _) => "Speech is brought to a steady level, then louder or quieter by this much.",
+                (false, 0) => "Sent as loud as the microphone delivers it.",
+                (false, _) => "Louder or quieter by this much. A limiter keeps it from clipping.",
+            },
+        ))
+    }
+
+    /// The microphones the other device sends, each with the settings it has
+    /// there, to be changed from here.
+    fn remote_section(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let State::Connected { name, .. } = &self.state else { return None };
+        let mut mics = self.stats.remote_sources.iter().filter(|source| source.kind == SourceKind::Mic).peekable();
+        mics.peek()?;
+        let mut section = section("THE OTHER DEVICE'S MICROPHONE").child(detail(format!(
+            "Filtered and levelled on {name} before it is sent. These are its own settings: \
+             a change made here is made there, and stays."
+        )));
+        for source in mics {
+            let title = format!("Microphone · stream {}", source.slot + 1);
+            let block = div().flex().flex_col().gap_1().child(div().text_size(px(13.)).child(title));
+            section = section.child(self.mic_controls(block, Mic::Remote(source.slot), remote_tuning(source), cx));
+        }
+        Some(section)
     }
 
     /// Where one kind of stream from the other device is played.
@@ -1065,6 +1148,9 @@ impl Render for Bridge {
             column = column.child(div().text_size(px(13.)).text_color(rgb(colour)).child(notice.text.clone()));
         }
         column = column.child(if in_session { self.session_section(cx) } else { self.peers_section(cx) });
+        if let Some(section) = self.remote_section(cx) {
+            column = column.child(section);
+        }
         column = column
             .child(self.send_section(cx))
             .child(self.play_section(Kind::Mic, cx))

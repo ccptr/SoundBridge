@@ -13,7 +13,7 @@ use soundbridge_core::denoise::{Gate, Mode};
 use soundbridge_core::gain::OFFSET_RANGE_DB;
 use soundbridge_core::{
     AudioBackend, BufferMode, Config, DEFAULT_PORT, DeviceDirection, Engine, Event, SinkConfig,
-    SinkKind, SourceConfig, SourceKind, State, Stats, StreamFormat, Streams,
+    SinkKind, SourceConfig, SourceKind, SourceSettings, State, Stats, StreamFormat, Streams,
 };
 use soundbridge_core::protocol::MAX_STREAMS;
 
@@ -61,7 +61,11 @@ Examples:
         --gate-hold 400 --gate-threshold 0.4
 
   Send a quiet microphone at a normal level, a little below the usual:
-    soundbridge connect 192.168.1.20 --send mic --auto-gain --gain -3";
+    soundbridge connect 192.168.1.20 --send mic --auto-gain --gain -3
+
+  Use a phone as this PC's microphone, and set from here how the phone
+  filters and levels it:
+    soundbridge listen --play virtual-mic --remote denoise=whole --remote gain=6";
 
 #[derive(Subcommand)]
 enum Command {
@@ -106,7 +110,6 @@ enum Command {
     },
 }
 
-#[cfg(feature = "self-update")]
 fn parse_switch(s: &str) -> Result<bool, String> {
     match s {
         "on" => Ok(true),
@@ -129,6 +132,54 @@ struct Sink {
     from: Streams,
     kind: Option<SinkKind>,
     device: Option<String>,
+}
+
+/// One `--remote`: a setting for the microphones the peer sends, or for the
+/// one stream that is numbered.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Remote {
+    slot: Option<u8>,
+    change: Change,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Change {
+    Denoise(Mode),
+    AutoGain(bool),
+    Gain(f32),
+}
+
+impl Remote {
+    /// `source` as it is wanted, if this is about it.
+    fn apply(&self, source: SourceSettings) -> SourceSettings {
+        if self.slot.is_some_and(|slot| slot != source.slot) {
+            return source;
+        }
+        match self.change {
+            Change::Denoise(denoise) => SourceSettings { denoise, ..source },
+            Change::AutoGain(auto_gain) => SourceSettings { auto_gain, ..source },
+            Change::Gain(gain_db) => SourceSettings { gain_db, ..source },
+        }
+    }
+}
+
+fn parse_remote(s: &str) -> Result<Remote, String> {
+    let (slot, setting) = match s.split_once(':') {
+        Some((number, setting)) if number.starts_with(|c: char| c.is_ascii_digit()) => {
+            let Streams::Slot(slot) = parse_streams(number)? else { unreachable!("a number is a slot") };
+            (Some(slot), setting)
+        }
+        _ => (None, s),
+    };
+    let expected = "expected denoise=MODE, auto-gain=on|off or gain=DB";
+    let (name, value) = setting.split_once('=').ok_or_else(|| format!("'{setting}' is not a setting: {expected}"))?;
+    let change = match name {
+        "denoise" => Change::Denoise(value.parse()?),
+        "auto-gain" => Change::AutoGain(parse_switch(value)?),
+        "gain" => Change::Gain(parse_gain(value)?),
+        _ => return Err(format!("'{name}' is not a setting: {expected}")),
+    };
+    Ok(Remote { slot, change })
 }
 
 fn parse_kind(s: &str) -> Result<SourceKind, String> {
@@ -239,6 +290,15 @@ struct LinkArgs {
     /// with `none` nowhere at all
     #[arg(short, long, value_name = "[KIND|N:]SINK[=ID]", default_value = "speaker", value_parser = parse_sink)]
     play: Vec<Sink>,
+
+    /// Set how the peer filters and levels the microphones it sends, as if
+    /// that had been set there: `denoise=MODE` (off, reduce, voice, whole,
+    /// or gate:LOOKAHEAD:HOLD:THRESHOLD for a tuning of the gate),
+    /// `auto-gain=on|off` or `gain=DB`. Prefix a number for one stream only
+    /// (`2:gain=6`). Repeat for several settings. What is not mentioned
+    /// stays as the peer has it
+    #[arg(long, value_name = "[N:]SETTING=VALUE", value_parser = parse_remote)]
+    remote: Vec<Remote>,
 
     /// Jitter buffer: `auto` adapts to the network, or a fixed size in ms
     #[arg(short, long, default_value = "auto", value_parser = parse_buffer)]
@@ -382,10 +442,10 @@ fn main() -> ExitCode {
     #[cfg(feature = "self-update")]
     let updated = matches!(command, Command::Listen { .. } | Command::Connect { .. }).then(auto_update);
     let result = match command {
-        Command::Listen { port, once, link } => run_link(link.config(port, true), None, once, link.quiet),
+        Command::Listen { port, once, link } => run_link(link.config(port, true), None, once, &link),
         Command::Connect { peer, link } => match resolve(&peer) {
             // Any free local port: the dialer does not need to be findable.
-            Ok(addr) => run_link(link.config(0, false), Some(addr), true, link.quiet),
+            Ok(addr) => run_link(link.config(0, false), Some(addr), true, &link),
             Err(e) => Err(e),
         },
         Command::Discover { timeout } => discover(timeout),
@@ -497,9 +557,15 @@ fn discover(timeout: f32) -> Result<(), String> {
     Ok(())
 }
 
+/// How a source is filtered and levelled, in the words of `--remote`.
+fn settings_text(source: &SourceSettings) -> String {
+    let auto_gain = if source.auto_gain { "on" } else { "off" };
+    format!("denoise={} auto-gain={auto_gain} gain={}", source.denoise, source.gain_db)
+}
+
 /// Runs a session until interrupted, or (with `until_idle`) until the first
 /// session ends.
-fn run_link(config: Config, dial: Option<SocketAddr>, until_idle: bool, quiet: bool) -> Result<(), String> {
+fn run_link(config: Config, dial: Option<SocketAddr>, until_idle: bool, link: &LinkArgs) -> Result<(), String> {
     let port = config.port;
     let (tx, rx) = mpsc::channel();
     let events = tx.clone();
@@ -518,7 +584,7 @@ fn run_link(config: Config, dial: Option<SocketAddr>, until_idle: bool, quiet: b
         let _ = tx.send(None);
     });
 
-    let mut status = Status::new(quiet, std::io::stderr().is_terminal());
+    let mut status = Status::new(link.quiet, std::io::stderr().is_terminal());
     match dial {
         Some(addr) => engine.connect(addr),
         None => status.line(&format!("Listening on port {}", engine.local_port())),
@@ -526,11 +592,15 @@ fn run_link(config: Config, dial: Option<SocketAddr>, until_idle: bool, quiet: b
 
     let mut was_connected = false;
     let mut failed = false;
+    // The peer's streams that --remote has been applied to. Each is asked
+    // once: after that, what is set at the other end stands.
+    let mut asked: Vec<u8> = Vec::new();
     while let Ok(Some(event)) = rx.recv() {
         match event {
             Event::State(State::Connecting { addr }) => status.line(&format!("Connecting to {addr}...")),
             Event::State(State::Connected { addr, name }) => {
                 was_connected = true;
+                asked.clear();
                 status.line(&format!("Connected to {name} ({addr})"));
             }
             Event::State(State::Idle) => {
@@ -542,7 +612,25 @@ fn run_link(config: Config, dial: Option<SocketAddr>, until_idle: bool, quiet: b
                 }
                 status.line("Waiting for a peer");
             }
-            Event::Stats(stats) => status.stats(&stats),
+            Event::Stats(stats) => {
+                let tunable = |source: &&SourceSettings| source.kind != SourceKind::System;
+                asked.retain(|slot| stats.remote_sources.iter().filter(tunable).any(|s| s.slot == *slot));
+                for source in stats.remote_sources.iter().filter(tunable) {
+                    if link.remote.is_empty() || asked.contains(&source.slot) {
+                        continue;
+                    }
+                    asked.push(source.slot);
+                    let wanted = link.remote.iter().fold(*source, |source, remote| remote.apply(source));
+                    if wanted != *source {
+                        engine.set_remote(wanted);
+                        status.line(&format!("Asking for stream {}: {}", source.slot + 1, settings_text(&wanted)));
+                    }
+                }
+                status.stats(&stats)
+            }
+            Event::SourceChanged(source) => {
+                status.line(&format!("The peer set stream {}: {}", source.slot + 1, settings_text(&source)))
+            }
             Event::Info(message) => status.line(&message),
             Event::Error(message) => status.line(&format!("error: {message}")),
             Event::Peers(_) => {}
@@ -798,6 +886,41 @@ mod tests {
         assert!(denoise(&["--denoise=loud"]).is_err());
         assert!(denoise(&["--gate-hold", "400"]).is_err());
         assert!(denoise(&["--denoise", "--gate-threshold", "2"]).is_err());
+    }
+
+    #[test]
+    fn settings_for_the_peer() {
+        let remote = |s| parse_remote(s).unwrap();
+        assert_eq!(remote("denoise=whole"), Remote { slot: None, change: Change::Denoise(Mode::WHOLE_WORDS) });
+        assert_eq!(
+            remote("2:denoise=gate:80:400:0.4"),
+            Remote {
+                slot: Some(1),
+                change: Change::Denoise(Mode::Gate(Gate { lookahead_ms: 80, hold_ms: 400, threshold: 0.4 }))
+            }
+        );
+        assert_eq!(remote("auto-gain=off").change, Change::AutoGain(false));
+        assert_eq!(remote("1:gain=-6"), Remote { slot: Some(0), change: Change::Gain(-6.0) });
+        for bad in ["denoise", "loud=1", "gain=90", "auto-gain=maybe", "0:gain=6", "denoise=gate:80"] {
+            assert!(parse_remote(bad).is_err(), "{bad}");
+        }
+
+        // Each stream takes what is said of all of them and of itself, in order.
+        let cli = Cli::try_parse_from([
+            "soundbridge", "listen", "--remote", "denoise=voice", "--remote", "gain=6", "--remote", "2:gain=-6",
+        ])
+        .unwrap();
+        let Command::Listen { link, .. } = cli.command else { panic!() };
+        let source = |slot| SourceSettings {
+            slot,
+            kind: SourceKind::Mic,
+            denoise: Mode::Off,
+            auto_gain: true,
+            gain_db: 0.0,
+        };
+        let wanted = |slot| link.remote.iter().fold(source(slot), |source, remote| remote.apply(source));
+        assert_eq!(wanted(0), SourceSettings { denoise: Mode::VOICE, gain_db: 6.0, ..source(0) });
+        assert_eq!(wanted(1), SourceSettings { denoise: Mode::VOICE, gain_db: -6.0, ..source(1) });
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! without having seen a handshake.
 
 use crate::audio::SourceKind;
+use crate::denoise::{Gate, Mode};
 
 /// Port every listening instance binds, and the one discovery probes go to.
 pub const DEFAULT_PORT: u16 = 47800;
@@ -31,6 +32,8 @@ const T_BYE: u8 = 5;
 const T_PING: u8 = 6;
 const T_PONG: u8 = 7;
 const T_AUDIO: u8 = 8;
+const T_SOURCES: u8 = 9;
+const T_SET: u8 = 10;
 
 /// Signed 16-bit little-endian PCM, interleaved. The only codec so far; the
 /// field exists so a compressed one can be added without a version bump.
@@ -55,6 +58,22 @@ pub struct Report {
     pub underruns: u32,
 }
 
+/// How one of an end's sources is filtered and levelled before it is sent.
+/// The sending end says so for each of its sources, and the receiving end
+/// can ask for something else: these are settings of the sender that only
+/// the receiver hears the effect of.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SourceSettings {
+    /// The sender's slot of the stream.
+    pub slot: u8,
+    /// What is in that slot. A request made for another kind of source than
+    /// the one now there is for a stream that has gone, and is ignored.
+    pub kind: SourceKind,
+    pub denoise: Mode,
+    pub auto_gain: bool,
+    pub gain_db: f32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudioHeader {
     /// Which of the sender's streams this is; stable while its source is.
@@ -70,7 +89,7 @@ pub struct AudioHeader {
     pub codec: u8,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Packet<'a> {
     Discover { instance: u32 },
     Announce { instance: u32, busy: bool, name: &'a str },
@@ -81,6 +100,12 @@ pub enum Packet<'a> {
     Ping { t_us: u64, reports: Vec<Report> },
     Pong { t_us: u64 },
     Audio { header: AudioHeader, payload: &'a [u8] },
+    /// Everything the sender of this packet sends, in slot order and at most
+    /// [`MAX_STREAMS`]. Goes out with every ping and whenever it changes.
+    Sources { sources: Vec<SourceSettings> },
+    /// Asks the peer to send one of its sources this way from now on. The
+    /// answer is its next [`Packet::Sources`].
+    Set { source: SourceSettings },
 }
 
 fn head(out: &mut Vec<u8>, kind: u8) {
@@ -105,6 +130,24 @@ fn kind_code(kind: SourceKind) -> u8 {
         SourceKind::System => 1,
         SourceKind::Tone => 2,
     }
+}
+
+const DENOISE_OFF: u8 = 0;
+const DENOISE_REDUCE: u8 = 1;
+const DENOISE_GATE: u8 = 2;
+
+fn put_source(out: &mut Vec<u8>, s: &SourceSettings) {
+    let (mode, gate) = match s.denoise {
+        Mode::Off => (DENOISE_OFF, Gate::VOICE),
+        Mode::Reduce => (DENOISE_REDUCE, Gate::VOICE),
+        Mode::Gate(gate) => (DENOISE_GATE, gate),
+    };
+    out.extend_from_slice(&[s.slot, kind_code(s.kind), mode]);
+    out.extend_from_slice(&(gate.lookahead_ms.min(u16::MAX as u32) as u16).to_le_bytes());
+    out.extend_from_slice(&(gate.hold_ms.min(u16::MAX as u32) as u16).to_le_bytes());
+    out.extend_from_slice(&gate.threshold.to_le_bytes());
+    out.push(s.auto_gain as u8);
+    out.extend_from_slice(&s.gain_db.to_le_bytes());
 }
 
 fn kind_from(code: u8) -> Option<SourceKind> {
@@ -163,6 +206,18 @@ impl Packet<'_> {
                 write_audio_header(out, header);
                 out.extend_from_slice(payload);
             }
+            Packet::Sources { ref sources } => {
+                head(out, T_SOURCES);
+                let sources = &sources[..sources.len().min(MAX_STREAMS)];
+                out.push(sources.len() as u8);
+                for source in sources {
+                    put_source(out, source);
+                }
+            }
+            Packet::Set { ref source } => {
+                head(out, T_SET);
+                put_source(out, source);
+            }
         }
     }
 
@@ -202,11 +257,31 @@ impl<'a> Reader<'a> {
     fn u8(&mut self) -> Option<u8> {
         self.take(1).map(|b| b[0])
     }
+    fn u16(&mut self) -> Option<u16> {
+        self.take(2).map(|b| u16::from_le_bytes(b.try_into().unwrap()))
+    }
     fn u32(&mut self) -> Option<u32> {
         self.take(4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
     }
     fn u64(&mut self) -> Option<u64> {
         self.take(8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    }
+    fn f32(&mut self) -> Option<f32> {
+        self.u32().map(f32::from_bits)
+    }
+    fn source(&mut self) -> Option<SourceSettings> {
+        let (slot, kind, mode) = (self.u8()?, kind_from(self.u8()?)?, self.u8()?);
+        let gate = Gate { lookahead_ms: self.u16()? as u32, hold_ms: self.u16()? as u32, threshold: self.f32()? };
+        let denoise = match mode {
+            DENOISE_OFF => Mode::Off,
+            DENOISE_REDUCE => Mode::Reduce,
+            DENOISE_GATE => Mode::Gate(gate),
+            _ => return None,
+        };
+        if slot as usize >= MAX_STREAMS {
+            return None;
+        }
+        Some(SourceSettings { slot, kind, denoise, auto_gain: self.u8()? != 0, gain_db: self.f32()? })
     }
     fn name(&mut self) -> Option<&'a str> {
         let len = self.u8()? as usize;
@@ -279,6 +354,18 @@ pub fn decode(buf: &[u8]) -> Option<Packet<'_>> {
             }
             Packet::Audio { header, payload }
         }
+        T_SOURCES => {
+            let count = r.u8()? as usize;
+            if count > MAX_STREAMS {
+                return None;
+            }
+            let mut sources = Vec::with_capacity(count);
+            for _ in 0..count {
+                sources.push(r.source()?);
+            }
+            Packet::Sources { sources }
+        }
+        T_SET => Packet::Set { source: r.source()? },
         _ => return None,
     })
 }
@@ -315,6 +402,18 @@ mod tests {
             },
             payload: &[1, 2, 3, 4, 5, 6, 7, 8],
         });
+        let mic = SourceSettings {
+            slot: 0,
+            kind: SourceKind::Mic,
+            denoise: Mode::Gate(Gate { lookahead_ms: 80, hold_ms: 2000, threshold: 0.3 }),
+            auto_gain: true,
+            gain_db: -4.5,
+        };
+        let system =
+            SourceSettings { slot: 63, kind: SourceKind::System, denoise: Mode::Off, auto_gain: false, gain_db: 0.0 };
+        roundtrip(Packet::Sources { sources: Vec::new() });
+        roundtrip(Packet::Sources { sources: vec![mic, system, SourceSettings { denoise: Mode::Reduce, ..mic }] });
+        roundtrip(Packet::Set { source: mic });
     }
 
     #[test]
@@ -349,6 +448,19 @@ mod tests {
         // A kind of source this version has never heard of.
         audio[5] = 9;
         assert_eq!(decode(&audio), None);
+        // Settings cut short, for a slot there cannot be, or filtered in a
+        // way this version does not know.
+        let source =
+            SourceSettings { slot: 1, kind: SourceKind::Mic, denoise: Mode::VOICE, auto_gain: true, gain_db: 6.0 };
+        let set = Packet::Set { source }.to_vec();
+        for n in 0..set.len() {
+            assert_eq!(decode(&set[..n]), None);
+        }
+        for (at, bad) in [(4, MAX_STREAMS as u8), (6, 3)] {
+            let mut set = set.clone();
+            set[at] = bad;
+            assert_eq!(decode(&set), None);
+        }
     }
 
     #[test]

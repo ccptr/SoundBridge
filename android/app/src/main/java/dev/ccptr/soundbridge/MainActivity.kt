@@ -182,29 +182,12 @@ private fun Screen() {
                 )
             }
             if (state.link == Link.Idle) PeersCard(state) else SessionCard(state)
+            (state.link as? Link.Connected)?.let { link -> RemoteMicsCard(link, state.stats.remoteMics) }
 
             Section("Send from this phone") {
                 Toggle("Microphone", state.settings.sendMic, setMicrophone)
                 if (state.settings.sendMic) {
-                    DenoiseChoices(state.settings)
-                    Toggle("Automatic level", state.settings.autoGain) { on ->
-                        Bridge.update { it.copy(autoGain = on) }
-                    }
-                    Choices(
-                        options = listOf(-12 to "-12", -6 to "-6", 0 to "0 dB", 6 to "+6", 12 to "+12", 24 to "+24"),
-                        selected = state.settings.gainDb,
-                        onSelect = { db -> Bridge.update { it.copy(gainDb = db) } },
-                    )
-                    Hint(
-                        when {
-                            state.settings.autoGain && state.settings.gainDb == 0 ->
-                                "Speech is brought to a steady level, however quiet the microphone is."
-                            state.settings.autoGain ->
-                                "Speech is brought to a steady level, then louder or quieter by this much."
-                            state.settings.gainDb == 0 -> "Sent as loud as the microphone delivers it."
-                            else -> "Louder or quieter by this much. A limiter keeps it from clipping."
-                        },
-                    )
+                    MicControls(state.settings.mic) { change -> Bridge.update { it.withMic(change(it.mic)) } }
                 }
                 Toggle("Phone audio", state.settings.sendPhoneAudio, setPhoneAudio)
                 if (state.settings.sendPhoneAudio) {
@@ -250,9 +233,45 @@ private val denoisePresets = listOf(
     Triple(Native.DENOISE_GATE, Gate.WHOLE_WORDS, "Voice+"),
 )
 
+/** The microphones the other device sends, each with the settings it has there. */
+@Composable
+private fun RemoteMicsCard(link: Link.Connected, mics: List<RemoteMic>) {
+    if (mics.isEmpty()) return
+    Section("The other device's microphone") {
+        Hint(
+            "Filtered and levelled on ${link.name} before it is sent. These are its own settings: " +
+                "a change made here is made there, and stays.",
+        )
+        for (mic in mics) {
+            if (mics.size > 1) Text("Microphone · stream ${mic.slot + 1}")
+            MicControls(mic.settings) { change -> Bridge.updateRemoteMic(mic.slot, change) }
+        }
+    }
+}
+
+/** How a microphone is filtered and levelled; [update] is given each change to make. */
+@Composable
+private fun MicControls(mic: MicSettings, update: ((MicSettings) -> MicSettings) -> Unit) {
+    DenoiseChoices(mic, update)
+    Toggle("Automatic level", mic.autoGain) { on -> update { it.copy(autoGain = on) } }
+    Choices(
+        options = listOf(-12 to "-12", -6 to "-6", 0 to "0 dB", 6 to "+6", 12 to "+12", 24 to "+24"),
+        selected = mic.gainDb,
+        onSelect = { db -> update { it.copy(gainDb = db) } },
+    )
+    Hint(
+        when {
+            mic.autoGain && mic.gainDb == 0 -> "Speech is brought to a steady level, however quiet the microphone is."
+            mic.autoGain -> "Speech is brought to a steady level, then louder or quieter by this much."
+            mic.gainDb == 0 -> "Sent as loud as the microphone delivers it."
+            else -> "Louder or quieter by this much. A limiter keeps it from clipping."
+        },
+    )
+}
+
 /** The presets and, with the gate on, each of its settings. */
 @Composable
-private fun DenoiseChoices(settings: Settings) {
+private fun DenoiseChoices(settings: MicSettings, update: ((MicSettings) -> MicSettings) -> Unit) {
     val gate = settings.gate
     // A tuning that is none of the presets leaves all of them unlit.
     val preset = denoisePresets.indexOfFirst { (mode, tuning, _) ->
@@ -263,7 +282,7 @@ private fun DenoiseChoices(settings: Settings) {
         selected = preset,
         onSelect = { index ->
             val (mode, tuning, _) = denoisePresets[index]
-            Bridge.update { it.copy(denoise = mode, gate = tuning ?: it.gate) }
+            update { it.copy(denoise = mode, gate = tuning ?: it.gate) }
         },
     )
     when (settings.denoise) {
@@ -272,7 +291,7 @@ private fun DenoiseChoices(settings: Settings) {
                 "Typing and clicks still come through in part. Adds about 10 ms of delay.",
         )
         Native.DENOISE_GATE -> {
-            val tune = { change: (Gate) -> Gate -> Bridge.update { it.copy(gate = change(it.gate)) } }
+            val tune = { change: (Gate) -> Gate -> update { it.copy(gate = change(it.gate)) } }
             Hint(
                 when (denoisePresets.getOrNull(preset)?.second) {
                     Gate.VOICE -> "Voice only, with the least delay. "

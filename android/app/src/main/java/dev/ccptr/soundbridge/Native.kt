@@ -56,6 +56,17 @@ object Native {
         gateThreshold: Float, autoGain: Boolean, gainDb: Int, play: Boolean, bufferMs: Int,
     )
 
+    /**
+     * Asks the other device to filter and level the microphone it sends in
+     * [slot] this way, as if that had been set there. The arguments are those
+     * of [start] for our own microphone.
+     */
+    @JvmStatic
+    external fun setRemoteMic(
+        handle: Long, slot: Int, denoise: Int, gateLookaheadMs: Int, gateHoldMs: Int, gateThreshold: Float,
+        autoGain: Boolean, gainDb: Int,
+    )
+
     /** [host] should be an IP literal: a name would be resolved on the calling thread. */
     @JvmStatic
     external fun connect(handle: Long, host: String, port: Int): Boolean

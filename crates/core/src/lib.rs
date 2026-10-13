@@ -34,7 +34,7 @@ pub use engine::{
     BufferMode, Config, Engine, Event, Peer, RxStats, SinkConfig, SourceConfig, State, Stats,
     Streams, TxStats,
 };
-pub use protocol::{DEFAULT_PORT, Report};
+pub use protocol::{DEFAULT_PORT, Report, SourceSettings};
 
 /// This machine's hostname, as the name to show peers by default.
 pub fn default_name() -> String {

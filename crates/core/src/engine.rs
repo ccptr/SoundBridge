@@ -13,6 +13,11 @@
 //! by its place in the list (its slot). An arriving stream is played on the
 //! sinks that name its slot, or failing those on each sink that takes its
 //! kind.
+//!
+//! How a microphone is filtered and levelled is a setting of the end that
+//! sends it, but it is the other end that hears the result. So each end
+//! tells the other how its sources are set, and takes requests to set a
+//! microphone differently ([`Engine::set_remote`], [`Event::SourceChanged`]).
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -33,9 +38,10 @@ pub use crate::playout::BufferMode;
 use crate::playout::{self, PlayoutWriter};
 use crate::protocol::{
     self, AudioHeader, BYE_BUSY, BYE_NORMAL, CAP_PLAYS, CAP_SENDS, MAX_STREAMS, Packet, Report,
+    SourceSettings,
 };
 use crate::sender::{Packetizer, StreamSpec, TxShared};
-use crate::{denoise, synthetic};
+use crate::{denoise, gain, synthetic};
 
 const HELLO_INTERVAL: Duration = Duration::from_millis(250);
 const PING_INTERVAL: Duration = Duration::from_millis(500);
@@ -49,6 +55,8 @@ const RETRY_DEVICE_AFTER: Duration = Duration::from_secs(2);
 /// An incoming stream this quiet has been stopped by its sender, and its
 /// output is closed.
 const STREAM_IDLE: Duration = Duration::from_secs(2);
+/// How long the peer is asked to change a source before giving up on it.
+const ASK_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SourceConfig {
@@ -80,6 +88,26 @@ impl SourceConfig {
             gain_db: 0.0,
         }
     }
+
+    /// What the peer is told about this source, and can ask to have changed.
+    fn settings(&self, slot: usize) -> SourceSettings {
+        SourceSettings {
+            slot: slot as u8,
+            kind: self.kind,
+            denoise: self.denoise,
+            auto_gain: self.auto_gain,
+            gain_db: self.gain_db,
+        }
+    }
+}
+
+/// A peer's request, brought within what a source can be set to.
+fn sanitized(settings: SourceSettings) -> SourceSettings {
+    let gain_db = match settings.gain_db {
+        db if db.is_finite() => db.clamp(*gain::OFFSET_RANGE_DB.start(), *gain::OFFSET_RANGE_DB.end()),
+        _ => 0.0,
+    };
+    SourceSettings { denoise: settings.denoise.clamped(), gain_db, ..settings }
 }
 
 /// Which of the peer's streams a sink plays.
@@ -227,6 +255,11 @@ pub struct Stats {
     pub tx: Vec<TxStats>,
     /// The streams being played, once per sink each goes to.
     pub rx: Vec<RxStats>,
+    /// Everything the peer sends, played here or not, and how each is set
+    /// there. A change asked for with [`Engine::set_remote`] shows at once,
+    /// and is taken back if the peer does not go along with it. Empty for a
+    /// peer too old to say.
+    pub remote_sources: Vec<SourceSettings>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -235,6 +268,10 @@ pub enum Event {
     Stats(Stats),
     /// The current set of discovered peers.
     Peers(Vec<Peer>),
+    /// The peer changed how one of this end's sources is sent, and the
+    /// engine has done so. The front end should take the change into its own
+    /// settings: the next [`Engine::configure`] is what counts again.
+    SourceChanged(SourceSettings),
     /// Something worth telling the user that is not a failure.
     Info(String),
     /// Something failed; the engine keeps running.
@@ -245,6 +282,7 @@ enum Command {
     Connect(SocketAddr),
     Disconnect,
     Configure(Box<Config>),
+    SetRemote(SourceSettings),
     Shutdown,
 }
 
@@ -305,6 +343,14 @@ impl Engine {
     /// a live session; the port cannot be changed after start.
     pub fn configure(&self, config: Config) {
         let _ = self.tx.send(Command::Configure(Box::new(config)));
+    }
+
+    /// Asks the peer to filter and level one of the microphones it sends
+    /// this way, as if that had been set there. `settings` names the stream
+    /// by the slot and kind it has in [`Stats::remote_sources`]; a request
+    /// for anything that is not listed there is dropped.
+    pub fn set_remote(&self, settings: SourceSettings) {
+        let _ = self.tx.send(Command::SetRemote(settings));
     }
 }
 
@@ -411,6 +457,21 @@ struct Session {
     rtt_us: Option<f32>,
     /// The peer's latest reports on the streams we send it.
     remote: Vec<Report>,
+    /// What the peer last said it sends.
+    remote_sources: Vec<SourceSettings>,
+    /// Changes to those that it has been asked for and has not yet made,
+    /// with when each was first asked.
+    asks: Vec<(SourceSettings, Instant)>,
+}
+
+impl Session {
+    /// The peer's sources as they will be once it has done what it was asked.
+    fn remote_sources(&self) -> Vec<SourceSettings> {
+        let asked = |source: &SourceSettings| {
+            self.asks.iter().map(|(ask, _)| *ask).find(|ask| (ask.slot, ask.kind) == (source.slot, source.kind))
+        };
+        self.remote_sources.iter().map(|source| asked(source).unwrap_or(*source)).collect()
+    }
 }
 
 enum Phase {
@@ -508,7 +569,21 @@ impl Worker {
                             *tx = TxSlot::pending(now);
                         }
                     }
+                    if old.send != self.config.send {
+                        self.advertise();
+                    }
                 }
+            }
+            Command::SetRemote(settings) => {
+                let settings = sanitized(settings);
+                let Phase::Connected(session) = &mut self.phase else { return };
+                let same = |s: &SourceSettings| (s.slot, s.kind) == (settings.slot, settings.kind);
+                if !session.remote_sources.iter().any(same) {
+                    return;
+                }
+                session.asks.retain(|(ask, _)| ask.slot != settings.slot);
+                session.asks.push((settings, Instant::now()));
+                send(&self.socket, Packet::Set { source: settings }, session.peer);
             }
             Command::Shutdown => unreachable!("handled by the run loop"),
         }
@@ -587,6 +662,13 @@ impl Worker {
                     let peer = session.peer;
                     let t_us = (now - self.epoch).as_micros() as u64;
                     send(&self.socket, Packet::Ping { t_us, reports }, peer);
+                    // Repeated until the peer says it is so, or for long
+                    // enough that it evidently will not.
+                    session.asks.retain(|(_, since)| now - *since < ASK_TIMEOUT);
+                    for (ask, _) in &session.asks {
+                        send(&self.socket, Packet::Set { source: *ask }, peer);
+                    }
+                    self.advertise();
                 } else if now - session.last_stats >= STATS_INTERVAL {
                     session.last_stats = now;
                     self.tend_streams(now);
@@ -631,11 +713,46 @@ impl Worker {
                                 }
                             })
                             .collect(),
+                        remote_sources: session.remote_sources(),
                     };
                     self.emit(Event::Stats(stats));
                 }
             }
         }
+    }
+
+    /// Tells the peer what this end sends and how each source is set.
+    fn advertise(&self) {
+        let Phase::Connected(session) = &self.phase else { return };
+        let sources = (self.config.send.iter().take(MAX_STREAMS).enumerate())
+            .map(|(slot, source)| source.settings(slot))
+            .collect();
+        send(&self.socket, Packet::Sources { sources }, session.peer);
+    }
+
+    /// The peer asks for one of our sources to be sent differently.
+    fn peer_set(&mut self, wanted: SourceSettings, from: SocketAddr, now: Instant) {
+        let wanted = sanitized(wanted);
+        let slot = wanted.slot as usize;
+        let Some(session) = self.session_from(from) else { return };
+        session.last_heard = now;
+        let Some(source) = self.config.send.get_mut(slot).filter(|_| slot < MAX_STREAMS) else { return };
+        // Device audio is sent as it is, and a source of another kind is not
+        // the one the peer was looking at.
+        if source.kind == wanted.kind && source.kind != SourceKind::System && source.settings(slot) != wanted {
+            source.denoise = wanted.denoise;
+            source.auto_gain = wanted.auto_gain;
+            source.gain_db = wanted.gain_db;
+            // Closed now; `tend_streams` opens it the new way.
+            if let (Phase::Connected(session), now) = (&mut self.phase, Instant::now())
+                && let Some(tx) = session.tx.get_mut(slot)
+            {
+                *tx = TxSlot::pending(now);
+            }
+            self.emit(Event::SourceChanged(wanted));
+        }
+        // The answer, whether or not anything changed.
+        self.advertise();
     }
 
     /// Broadcasts a discovery probe on every IPv4 interface.
@@ -745,6 +862,18 @@ impl Worker {
                 }
             }
             Packet::Audio { header, payload } => self.audio(header, payload, from, now),
+            Packet::Sources { sources } => {
+                if let Some(session) = self.session_from(from) {
+                    session.last_heard = now;
+                    // Done, or about a source that is no longer there.
+                    session.asks.retain(|(ask, _)| {
+                        let source = sources.iter().find(|s| s.slot == ask.slot);
+                        source.is_some_and(|source| source.kind == ask.kind && source != ask)
+                    });
+                    session.remote_sources = sources;
+                }
+            }
+            Packet::Set { source } => self.peer_set(source, from, now),
         }
     }
 
@@ -769,8 +898,11 @@ impl Worker {
             rx: Vec::new(),
             rtt_us: None,
             remote: Vec::new(),
+            remote_sources: Vec::new(),
+            asks: Vec::new(),
         }));
         self.emit(Event::State(State::Connected { addr: peer, name }));
+        self.advertise();
         self.tend_streams(now);
     }
 

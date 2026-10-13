@@ -35,6 +35,15 @@ data class Gate(
     }
 }
 
+/** How a microphone is filtered and levelled before it is sent: ours, or the other device's. */
+data class MicSettings(
+    /** A `Native.DENOISE_` value. */
+    val denoise: Int,
+    val gate: Gate,
+    val autoGain: Boolean,
+    val gainDb: Int,
+)
+
 data class Settings(
     val sendMic: Boolean = false,
     /**
@@ -64,6 +73,12 @@ data class Settings(
 
     val sendFlags: Int
         get() = (if (sendMic) Native.SEND_MIC else 0) or (if (sendPhoneAudio) Native.SEND_SYSTEM else 0)
+
+    val mic: MicSettings
+        get() = MicSettings(denoise, gate, autoGain, gainDb)
+
+    fun withMic(mic: MicSettings) =
+        copy(denoise = mic.denoise, gate = mic.gate, autoGain = mic.autoGain, gainDb = mic.gainDb)
 }
 
 sealed interface Link {
@@ -101,11 +116,20 @@ data class RxStats(
     val underruns: Int,
 )
 
+/** A microphone the other device sends, and how it is set there. */
+data class RemoteMic(
+    /** The other device's number for the stream, from 0. */
+    val slot: Int,
+    val settings: MicSettings,
+)
+
 data class Stats(
     val rttMs: Float? = null,
     /** Streams being sent. A source missing here could not be opened. */
     val tx: List<TxStats> = emptyList(),
     val rx: List<RxStats> = emptyList(),
+    /** Empty if the other device sends no microphone, or is too old to say. */
+    val remoteMics: List<RemoteMic> = emptyList(),
 )
 
 data class Notice(val text: String, val error: Boolean)
@@ -203,6 +227,25 @@ object Bridge : Native.Listener {
             )
         }
         reconcile()
+    }
+
+    /**
+     * Changes how the other device filters and levels the microphone it
+     * sends in [slot]. Shown at once; the engine's next report confirms it,
+     * or takes it back.
+     */
+    fun updateRemoteMic(slot: Int, change: (MicSettings) -> MicSettings) {
+        val old = _state.value.stats.remoteMics.firstOrNull { it.slot == slot } ?: return
+        val new = change(old.settings)
+        if (new == old.settings || handle == 0L) return
+        _state.update { state ->
+            val mics = state.stats.remoteMics.map { if (it.slot == slot) it.copy(settings = new) else it }
+            state.copy(stats = state.stats.copy(remoteMics = mics))
+        }
+        Native.setRemoteMic(
+            handle, slot, new.denoise, new.gate.lookaheadMs, new.gate.holdMs, new.gate.threshold, new.autoGain,
+            new.gainDb,
+        )
     }
 
     /** Connects to "host" or "host:port". Name lookup happens off the main thread. */
@@ -311,6 +354,17 @@ object Bridge : Native.Listener {
                 _state.update { it.copy(peers = peers) }
             }
             "stats" -> _state.update { it.copy(stats = parseStats(event)) }
+            // The other device changed how our microphone is sent, and the
+            // engine has done so: make it our setting, as if chosen here.
+            "source" -> main.post {
+                val settings = _state.value.settings
+                val slot = settings.sources.indexOf("mic")
+                if (event.optString("kind") == "mic" && event.optInt("slot", -1) == slot) {
+                    update { it.withMic(parseMic(event, it.gate)) }
+                    val from = (_state.value.link as? Link.Connected)?.name ?: "the other device"
+                    notice("The microphone was set from $from", error = false)
+                }
+            }
             "info" -> notice(event.optString("text"), error = false)
             "error" -> notice(event.optString("text"), error = true)
         }
@@ -320,6 +374,22 @@ object Bridge : Native.Listener {
         val array = optJSONArray(name) ?: return emptyList()
         return (0 until array.length()).map { item(array.getJSONObject(it)) }
     }
+
+    /** [gate] is the tuning to keep while the gate is off, when none is given. */
+    private fun parseMic(o: JSONObject, gate: Gate) = MicSettings(
+        denoise = when (o.optString("denoise")) {
+            "reduce" -> Native.DENOISE_REDUCE
+            "gate" -> Native.DENOISE_GATE
+            else -> Native.DENOISE_OFF
+        },
+        gate = if (o.has("lookahead")) {
+            Gate(o.optInt("lookahead"), o.optInt("hold"), o.optDouble("threshold").toFloat())
+        } else {
+            gate
+        },
+        autoGain = o.optBoolean("autoGain"),
+        gainDb = o.optInt("gainDb"),
+    )
 
     private fun parseStats(o: JSONObject) = Stats(
         rttMs = if (o.has("rtt")) o.optDouble("rtt").toFloat() else null,
@@ -352,6 +422,9 @@ object Bridge : Native.Listener {
                 lost = it.optInt("lost"),
                 underruns = it.optInt("underruns"),
             )
+        },
+        remoteMics = o.list("sources") { it }.filter { it.optString("kind") == "mic" }.map {
+            RemoteMic(it.optInt("slot"), parseMic(it, Gate.VOICE))
         },
     )
 }
