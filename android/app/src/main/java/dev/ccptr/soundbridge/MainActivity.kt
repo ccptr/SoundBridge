@@ -54,8 +54,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
@@ -66,6 +68,9 @@ import kotlin.math.log10
 
 /** API level of Android 17, which introduced ACCESS_LOCAL_NETWORK. */
 private const val ANDROID_17 = 37
+
+/** The longest name the protocol carries, in bytes. */
+private const val MAX_NAME_LEN = 64
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -187,20 +192,19 @@ private fun Screen() {
             Section("Send from this phone") {
                 Toggle("Microphone", state.settings.sendMic, setMicrophone)
                 if (state.settings.sendMic) {
+                    NameField(state.settings.micName) { name -> Bridge.update { it.copy(micName = name) } }
                     MicControls(state.settings.mic) { change -> Bridge.update { it.withMic(change(it.mic)) } }
                 }
                 Toggle("Phone audio", state.settings.sendPhoneAudio, setPhoneAudio)
                 if (state.settings.sendPhoneAudio) {
+                    NameField(state.settings.phoneAudioName) { name ->
+                        Bridge.update { it.copy(phoneAudioName = name) }
+                    }
                     Hint("Sends what apps are playing. Calls, and apps that forbid capture, stay silent.")
                 }
             }
 
-            Section("Play what the other device sends") {
-                Toggle(
-                    if (state.settings.play) "On this phone's speaker or headphones" else "Off",
-                    state.settings.play,
-                ) { on -> Bridge.update { it.copy(play = on) } }
-            }
+            StreamsCard(state)
 
             Section("Jitter buffer") {
                 Choices(
@@ -232,6 +236,62 @@ private val denoisePresets = listOf(
     Triple(Native.DENOISE_GATE, Gate.VOICE, "Voice"),
     Triple(Native.DENOISE_GATE, Gate.WHOLE_WORDS, "Voice+"),
 )
+
+/**
+ * The streams the other device sends, and the ones switched off from when it
+ * last did, each with whether it plays here.
+ */
+@Composable
+private fun StreamsCard(state: UiState) {
+    val muted = state.settings.muted
+    // The source of each stream with what to call it and what the other
+    // device calls it: what it says, then what was kept from when it last did.
+    val sent = state.stats.streams.map { Triple(it.id, it.name.ifEmpty { kindTitle(it.kind) ?: it.id }, it.name) }
+    val kept = muted.map { (id, name) -> Triple(id, name.ifEmpty { kindTitle(id) ?: id }, name) }
+    val streams = (sent + kept).distinctBy { it.first }
+    Section("Play what the other device sends") {
+        Hint("Each stream plays on this phone's speaker or headphones, unless it is switched off here.")
+        if (streams.isEmpty()) Hint("Its streams are listed once it is connected and sends any.")
+        for ((id, title, name) in streams) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    // The id is what the choice is kept by; shown where the name is not it.
+                    if (title != id) {
+                        Text(
+                            id,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                Switch(checked = id !in muted, onCheckedChange = { on -> Bridge.setPlayed(id, name, on) })
+            }
+        }
+    }
+}
+
+/**
+ * What a source is shown as at the other end, where its place is kept by
+ * what it is and not by this. Set on Done, or on leaving the field.
+ */
+@Composable
+private fun NameField(name: String, onSet: (String) -> Unit) {
+    var text by rememberSaveable(name) { mutableStateOf(name) }
+    val focus = LocalFocusManager.current
+    val set = { if (text.trim() != name) onSet(text.trim()) }
+    OutlinedTextField(
+        value = text,
+        onValueChange = { text = it.take(MAX_NAME_LEN) },
+        singleLine = true,
+        label = { Text("Name at the other end") },
+        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+        keyboardActions = KeyboardActions(onDone = { set(); focus.clearFocus() }),
+        modifier = Modifier.fillMaxWidth().onFocusChanged { if (!it.isFocused) set() },
+    )
+}
 
 /** The microphones the other device sends, each with the settings it has there. */
 @Composable
@@ -443,10 +503,10 @@ private fun SessionCard(state: UiState) {
             val sources = state.settings.sources
             if (sources.isEmpty()) Hint("Not sending anything.")
             sources.forEachIndexed { slot, kind ->
-                val name = kindName(kind)
+                val name = state.settings.nameOf(kind).ifEmpty { kindName(kind) }
                 val tx = stats.tx.firstOrNull { it.slot == slot }
                 if (tx == null) {
-                    Hint("Not sending the $name: it could not be opened.")
+                    Hint("Not sending the ${kindName(kind)}: it could not be opened.")
                 } else {
                     Text(
                         "Sending $name · ${formatOf(tx.rate, tx.channels)}" +
@@ -471,11 +531,11 @@ private fun SessionCard(state: UiState) {
 
             when {
                 stats.rx.isNotEmpty() -> {}
-                !state.settings.play -> Hint("Ignoring incoming audio.")
+                stats.streams.isNotEmpty() -> Hint("Not playing what the other device sends.")
                 else -> Hint("The other device is not sending anything.")
             }
             for (rx in stats.rx) {
-                Text("Receiving ${kindName(rx.kind)} · ${formatOf(rx.rate, rx.channels)}")
+                Text("Receiving ${rx.name.ifEmpty { kindName(rx.kind) }} · ${formatOf(rx.rate, rx.channels)}")
                 Meter(rx.level)
                 Hint(
                     if (!rx.playing) "Buffering…"
@@ -488,6 +548,14 @@ private fun SessionCard(state: UiState) {
             Text(if (link is Link.Connected) "Disconnect" else "Cancel")
         }
     }
+}
+
+/** What a stream without a name is listed as; null for one of no known kind. */
+private fun kindTitle(kind: String) = when (kind) {
+    "mic" -> "Microphone"
+    "system" -> "Device audio"
+    "tone" -> "Test tone"
+    else -> null
 }
 
 private fun kindName(kind: String) = when (kind) {

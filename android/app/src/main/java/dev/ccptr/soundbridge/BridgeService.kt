@@ -107,7 +107,7 @@ class BridgeService : Service() {
         }
         if (withProjection) types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
         // Also the fallback: a service must declare at least one type.
-        if ((linked && state.settings.play) || types == 0) {
+        if (linked || types == 0) {
             types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
         }
         try {

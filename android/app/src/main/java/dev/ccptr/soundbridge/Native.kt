@@ -38,12 +38,16 @@ object Native {
      * arguments tune [DENOISE_GATE]: how far it looks ahead, how long it
      * stays open after the voice, and how sure of a voice it must be (0..1).
      * [autoGain] brings the microphone to a steady level, and [gainDb] is
-     * added to that, or is the whole gain without it.
+     * added to that, or is the whole gain without it. [micName] and
+     * [systemName] are what the other device is told to show the two sources
+     * as, empty for nothing. [mute] holds the ids of the other device's
+     * sources that are played nowhere; the rest play.
      */
     @JvmStatic
     external fun start(
-        name: String, send: Int, denoise: Int, gateLookaheadMs: Int, gateHoldMs: Int, gateThreshold: Float,
-        autoGain: Boolean, gainDb: Int, play: Boolean, bufferMs: Int, listener: Listener,
+        name: String, send: Int, micName: String, systemName: String, denoise: Int, gateLookaheadMs: Int,
+        gateHoldMs: Int, gateThreshold: Float, autoGain: Boolean, gainDb: Int, mute: Array<String>, bufferMs: Int,
+        listener: Listener,
     ): Long
 
     /** Hangs up, stops the engine and waits for its thread to finish. */
@@ -52,8 +56,9 @@ object Native {
 
     @JvmStatic
     external fun configure(
-        handle: Long, name: String, send: Int, denoise: Int, gateLookaheadMs: Int, gateHoldMs: Int,
-        gateThreshold: Float, autoGain: Boolean, gainDb: Int, play: Boolean, bufferMs: Int,
+        handle: Long, name: String, send: Int, micName: String, systemName: String, denoise: Int,
+        gateLookaheadMs: Int, gateHoldMs: Int, gateThreshold: Float, autoGain: Boolean, gainDb: Int,
+        mute: Array<String>, bufferMs: Int,
     )
 
     /**

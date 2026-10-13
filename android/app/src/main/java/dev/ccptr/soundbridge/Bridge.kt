@@ -46,6 +46,8 @@ data class MicSettings(
 
 data class Settings(
     val sendMic: Boolean = false,
+    /** What the other device is told to show the microphone as. Empty for nothing. */
+    val micName: String = "",
     /**
      * What is filtered out of the microphone, a `Native.DENOISE_` value:
      * nothing, background noise, or everything but speech.
@@ -61,7 +63,14 @@ data class Settings(
     /** Gain in dB, on top of the automatic one or on its own. */
     val gainDb: Int = 0,
     val sendPhoneAudio: Boolean = false,
-    val play: Boolean = true,
+    /** As [micName], for phone audio. */
+    val phoneAudioName: String = "",
+    /**
+     * The other device's streams that are played nowhere: the id it knows
+     * each source by, with what it last called it, for when it is not there
+     * to say. One that is not listed plays.
+     */
+    val muted: Map<String, String> = emptyMap(),
     /** Fixed jitter buffer in ms, or [Native.BUFFER_AUTO]. */
     val bufferMs: Int = Native.BUFFER_AUTO,
     /** The last address typed into the connect box. */
@@ -70,6 +79,9 @@ data class Settings(
     /** What is sent, in the engine's order, which is how it tells us of each. */
     val sources: List<String>
         get() = listOfNotNull("mic".takeIf { sendMic }, "system".takeIf { sendPhoneAudio })
+
+    /** What the source of this kind is named, if anything. */
+    fun nameOf(kind: String) = if (kind == "mic") micName else phoneAudioName
 
     val sendFlags: Int
         get() = (if (sendMic) Native.SEND_MIC else 0) or (if (sendPhoneAudio) Native.SEND_SYSTEM else 0)
@@ -104,6 +116,10 @@ data class TxStats(
 )
 
 data class RxStats(
+    /** The id the other device knows the source by; empty until it has said. */
+    val id: String,
+    /** What the other device calls it; empty if it does not say. */
+    val name: String,
     /** "mic", "system" or "tone". */
     val kind: String,
     val rate: Int,
@@ -125,11 +141,23 @@ data class RemoteMic(
     val settings: MicSettings,
 )
 
+/** One of the streams the other device sends, played here or not. */
+data class RemoteStream(
+    /** What the other device knows the source by for good, and what [Settings.muted] holds. */
+    val id: String,
+    /** What the other device calls it; empty if it does not say. */
+    val name: String,
+    /** "mic", "system" or "tone"; empty for a stream it has not described. */
+    val kind: String,
+)
+
 data class Stats(
     val rttMs: Float? = null,
     /** Streams being sent. A source missing here could not be opened. */
     val tx: List<TxStats> = emptyList(),
     val rx: List<RxStats> = emptyList(),
+    /** Everything the other device sends. */
+    val streams: List<RemoteStream> = emptyList(),
     /** Empty if the other device sends no microphone, or is too old to say. */
     val remoteMics: List<RemoteMic> = emptyList(),
 )
@@ -177,6 +205,8 @@ object Bridge : Native.Listener {
             // is not restored. ("send" is how the choice was stored before
             // there could be several.)
             sendMic = prefs.getBoolean("sendMic", prefs.getInt("send", 0) == 1),
+            micName = prefs.getString("micName", "") ?: "",
+            phoneAudioName = prefs.getString("phoneAudioName", "") ?: "",
             // "denoise" is the switch that voice only was before there were modes.
             denoise = prefs.getInt(
                 "denoiseMode",
@@ -189,7 +219,10 @@ object Bridge : Native.Listener {
             ),
             autoGain = prefs.getBoolean("autoGain", true),
             gainDb = prefs.getInt("gainDb", 0),
-            play = prefs.getBoolean("play", true),
+            muted = prefs.getString("muted", null)?.let(::parseMuted)
+                // "play" was one switch for everything, before a stream had
+                // an id. Off, it carries over to the two a device has by default.
+                ?: if (prefs.getBoolean("play", true)) emptyMap() else mapOf("mic" to "", "system" to ""),
             bufferMs = prefs.getInt("bufferMs", Native.BUFFER_AUTO),
             host = prefs.getString("host", "") ?: "",
         )
@@ -208,6 +241,8 @@ object Bridge : Native.Listener {
         _state.update { it.copy(settings = new) }
         app.getSharedPreferences("settings", Context.MODE_PRIVATE).edit {
             putBoolean("sendMic", new.sendMic)
+            putString("micName", new.micName)
+            putString("phoneAudioName", new.phoneAudioName)
             remove("denoise")
             putInt("denoiseMode", new.denoise)
             putInt("gateLookaheadMs", new.gate.lookaheadMs)
@@ -215,7 +250,8 @@ object Bridge : Native.Listener {
             putFloat("gateThreshold", new.gate.threshold)
             putBoolean("autoGain", new.autoGain)
             putInt("gainDb", new.gainDb)
-            putBoolean("play", new.play)
+            remove("play")
+            putString("muted", JSONObject(new.muted).toString())
             putInt("bufferMs", new.bufferMs)
             putString("host", new.host)
         }
@@ -224,8 +260,9 @@ object Bridge : Native.Listener {
         }
         if (handle != 0L) {
             Native.configure(
-                handle, deviceName, new.sendFlags, new.denoise, new.gate.lookaheadMs, new.gate.holdMs,
-                new.gate.threshold, new.autoGain, new.gainDb, new.play, new.bufferMs,
+                handle, deviceName, new.sendFlags, new.micName, new.phoneAudioName, new.denoise,
+                new.gate.lookaheadMs, new.gate.holdMs, new.gate.threshold, new.autoGain, new.gainDb,
+                new.muted.keys.toTypedArray(), new.bufferMs,
             )
         }
         reconcile()
@@ -248,6 +285,14 @@ object Bridge : Native.Listener {
             handle, slot, new.denoise, new.gate.lookaheadMs, new.gate.holdMs, new.gate.threshold, new.autoGain,
             new.gainDb,
         )
+    }
+
+    /**
+     * Plays the stream from the other device's source [id], or plays it
+     * nowhere; [name] is what the other device calls it now.
+     */
+    fun setPlayed(id: String, name: String, played: Boolean) {
+        update { it.copy(muted = if (played) it.muted - id else it.muted + (id to name)) }
     }
 
     /** Connects to "host" or "host:port". Name lookup happens off the main thread. */
@@ -310,8 +355,8 @@ object Bridge : Native.Listener {
         }
         val s = _state.value.settings
         handle = Native.start(
-            deviceName, s.sendFlags, s.denoise, s.gate.lookaheadMs, s.gate.holdMs, s.gate.threshold, s.autoGain,
-            s.gainDb, s.play, s.bufferMs, this,
+            deviceName, s.sendFlags, s.micName, s.phoneAudioName, s.denoise, s.gate.lookaheadMs, s.gate.holdMs,
+            s.gate.threshold, s.autoGain, s.gainDb, s.muted.keys.toTypedArray(), s.bufferMs, this,
         )
         _state.update { it.copy(online = handle != 0L, peers = emptyList()) }
         if (handle == 0L) notice("Could not open a network socket", error = true)
@@ -355,7 +400,16 @@ object Bridge : Native.Listener {
                 }
                 _state.update { it.copy(peers = peers) }
             }
-            "stats" -> _state.update { it.copy(stats = parseStats(event)) }
+            "stats" -> {
+                val stats = parseStats(event)
+                _state.update { it.copy(stats = stats) }
+                // What a stream that is switched off is called is kept for
+                // when the other device is not there to say.
+                val names = stats.streams.associate { it.id to it.name }
+                val renamed = { muted: Map<String, String> -> muted.mapValues { (id, name) -> names[id] ?: name } }
+                val muted = _state.value.settings.muted
+                if (renamed(muted) != muted) main.post { update { it.copy(muted = renamed(it.muted)) } }
+            }
             // The other device changed how our microphone is sent, and the
             // engine has done so: make it our setting, as if chosen here.
             "source" -> main.post {
@@ -375,6 +429,11 @@ object Bridge : Native.Listener {
     private fun <T> JSONObject.list(name: String, item: (JSONObject) -> T): List<T> {
         val array = optJSONArray(name) ?: return emptyList()
         return (0 until array.length()).map { item(array.getJSONObject(it)) }
+    }
+
+    private fun parseMuted(json: String): Map<String, String> {
+        val o = runCatching { JSONObject(json) }.getOrNull() ?: return emptyMap()
+        return o.keys().asSequence().associateWith { o.optString(it) }
     }
 
     /** [gate] is the tuning to keep while the gate is off, when none is given. */
@@ -414,6 +473,8 @@ object Bridge : Native.Listener {
         },
         rx = o.list("rx") {
             RxStats(
+                id = it.optString("id"),
+                name = it.optString("name"),
                 kind = it.optString("kind"),
                 rate = it.optInt("rate"),
                 channels = it.optInt("channels"),
@@ -425,6 +486,7 @@ object Bridge : Native.Listener {
                 underruns = it.optInt("underruns"),
             )
         },
+        streams = o.list("streams") { RemoteStream(it.optString("id"), it.optString("name"), it.optString("kind")) },
         remoteMics = o.list("sources") { it }.filter { it.optString("kind") == "mic" }.map {
             RemoteMic(it.optInt("slot"), it.optString("name"), parseMic(it, Gate.VOICE))
         },

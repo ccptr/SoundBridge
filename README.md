@@ -22,9 +22,9 @@ recording.
 | Goal | Phone | PC |
 |---|---|---|
 | Phone as the PC's microphone | Send: Microphone | Play Microphone: Virtual microphone |
-| Hear the PC on the phone | Play: on | Send: PC audio |
+| Hear the PC on the phone | Play Device audio: on | Send: PC audio |
 | Hear the phone on the PC | Send: Phone audio | Play Device audio: Default output |
-| PC microphone to the phone | Play: on | Send: Microphone |
+| PC microphone to the phone | Play Microphone: on | Send: Microphone |
 | Phone as microphone, and hear the phone too | Send: Microphone + Phone audio | Play Microphone: Virtual microphone, Device audio: Default output |
 
 The apps find each other on the local network; an address can also be typed
@@ -57,7 +57,8 @@ other sources are added or removed, or when the stream is renamed.
 
 Next to the id a stream has a **name**, which is only what it is shown as.
 It starts as the name of the device and can be changed on the sending end:
-"Rename" in the desktop app, `--send NAME:mic=ID` on the command line.
+"Rename" in the desktop app, "Name at the other end" in the Android app,
+`--send NAME:mic=ID` on the command line.
 
 The receiving end gives each stream its place by its source ("Play what the
 other device sends" in the desktop app, `--play SOURCE:SINK` on the command
@@ -84,8 +85,12 @@ soundbridge listen --play HEADSET:virtual-mic --play WEBCAM:speaker=ID --play sp
 - A source can be sent once: a second stream from the same device is not
   sent, and that is said.
 - The command line prints each source the peer sends when it first arrives
-  (`The peer sends ID (name)`), and shows streams by name after that. The
-  Android app plays everything in one place.
+  (`The peer sends ID (name)`), and shows streams by name after that.
+- The Android app lists each stream under its name with a switch. A phone
+  has one place to play in, its current speaker or headphones, so a stream
+  plays there or nowhere; one switched off is kept by its source's id like
+  a place in the desktop app. What was a single play switch, if it was
+  off, becomes `mic` and `system` switched off.
 
 Through 0.3.0 a place was given to a kind of stream or to its number in the
 sender's list (`--play mic:SINK`, `--play 2:SINK`, "Play the other device's

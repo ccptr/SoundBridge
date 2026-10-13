@@ -14,12 +14,12 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
 use jni::JNIEnv;
-use jni::objects::{JByteBuffer, JClass, JObject, JString, JValue};
+use jni::objects::{JByteBuffer, JClass, JObject, JObjectArray, JString, JValue};
 use jni::sys::{jboolean, jfloat, jint, jlong};
 use soundbridge_core::denoise::{Gate, Mode};
 use soundbridge_core::{
     BufferMode, Config, DEFAULT_PORT, Engine, Event, SinkConfig, SinkKind, SourceConfig,
-    SourceKind, SourceSettings, State,
+    SourceKind, SourceSettings, State, Streams,
 };
 
 /// The `denoise` argument; anything else is off.
@@ -44,8 +44,9 @@ fn log_error(message: &str) {
 }
 
 /// What the app chose for the microphone.
-#[derive(Clone, Copy)]
 struct Mic {
+    /// What the other device is told to show it as; empty for nothing.
+    name: String,
     denoise: Mode,
     auto_gain: bool,
     gain_db: jint,
@@ -63,10 +64,14 @@ fn denoise_mode(mode: jint, lookahead_ms: jint, hold_ms: jint, threshold: jfloat
     }
 }
 
-fn config(name: String, send: jint, mic: Mic, play: bool, buffer_ms: jint) -> Config {
+/// `system_name` is to phone audio what [`Mic::name`] is to the microphone.
+/// `mute` holds the ids of the other device's sources that are played
+/// nowhere; the rest play on the current route.
+fn config(name: String, send: jint, mic: Mic, system_name: String, mute: Vec<String>, buffer_ms: jint) -> Config {
     let mut sources = Vec::new();
     if send & SEND_MIC != 0 {
         sources.push(SourceConfig {
+            name: mic.name,
             denoise: mic.denoise,
             auto_gain: mic.auto_gain,
             gain_db: mic.gain_db as f32,
@@ -74,8 +79,11 @@ fn config(name: String, send: jint, mic: Mic, play: bool, buffer_ms: jint) -> Co
         });
     }
     if send & SEND_SYSTEM != 0 {
-        sources.push(SourceConfig::new(SourceKind::System));
+        sources.push(SourceConfig { name: system_name, ..SourceConfig::new(SourceKind::System) });
     }
+    // A stream that is named, even to play nowhere, is kept from where the
+    // ones that are not named go.
+    let nowhere = |id| SinkConfig { from: Streams::Source(id), ..SinkConfig::new(SinkKind::Nothing) };
     Config {
         name,
         port: DEFAULT_PORT,
@@ -83,7 +91,7 @@ fn config(name: String, send: jint, mic: Mic, play: bool, buffer_ms: jint) -> Co
         listen: true,
         discover: true,
         send: sources,
-        play: play.then(|| SinkConfig::new(SinkKind::Speaker)).into_iter().collect(),
+        play: mute.into_iter().map(nowhere).chain([SinkConfig::new(SinkKind::Speaker)]).collect(),
         buffer: match buffer_ms {
             ms if ms >= 0 => BufferMode::Fixed { ms: ms as f32 },
             _ => BufferMode::default(),
@@ -94,6 +102,18 @@ fn config(name: String, send: jint, mic: Mic, play: bool, buffer_ms: jint) -> Co
 
 fn string(env: &mut JNIEnv, s: &JString) -> String {
     env.get_string(s).map(Into::into).unwrap_or_default()
+}
+
+fn strings(env: &mut JNIEnv, array: &JObjectArray) -> Vec<String> {
+    let len = env.get_array_length(array).unwrap_or(0);
+    let mut out = Vec::new();
+    for i in 0..len {
+        let Ok(item) = env.get_object_array_element(array, i) else { continue };
+        let item = JString::from(item);
+        out.push(string(env, &item));
+        let _ = env.delete_local_ref(item);
+    }
+    out
 }
 
 fn json_string(out: &mut String, s: &str) {
@@ -212,9 +232,14 @@ fn event_json(event: &Event) -> String {
                 if i > 0 {
                     o.push(',');
                 }
+                let stream = stats.remote_stream(rx.slot);
+                o.push_str(r#"{"id":"#);
+                json_string(&mut o, stream.map_or("", |stream| &stream.id));
+                o.push_str(r#","name":"#);
+                json_string(&mut o, stream.map_or("", |stream| &stream.name));
                 let _ = write!(
                     o,
-                    r#"{{"kind":"{}","rate":{},"channels":{},"level":{},"playing":{},"buffer":{},"jitter":{},"lost":{},"underruns":{}}}"#,
+                    r#","kind":"{}","rate":{},"channels":{},"level":{},"playing":{},"buffer":{},"jitter":{},"lost":{},"underruns":{}}}"#,
                     kind_name(rx.kind),
                     rx.format.sample_rate,
                     rx.format.channels,
@@ -233,6 +258,18 @@ fn event_json(event: &Event) -> String {
                 o.push_str(r#","name":"#);
                 json_string(&mut o, stats.remote_stream(source.slot).map_or("", |stream| &stream.name));
                 o.push('}');
+            }
+            // Everything the other device sends, played here or not. The
+            // kind is missing for a stream it has not described.
+            o.push_str(r#"],"streams":["#);
+            for (i, stream) in stats.remote_streams.iter().enumerate() {
+                let kind = (stats.remote_sources.iter().find(|source| source.slot == stream.slot).map(|s| s.kind))
+                    .or_else(|| stats.rx.iter().find(|rx| rx.slot == stream.slot).map(|rx| rx.kind));
+                o.push_str(if i > 0 { r#",{"id":"# } else { r#"{"id":"# });
+                json_string(&mut o, &stream.id);
+                o.push_str(r#","name":"#);
+                json_string(&mut o, &stream.name);
+                let _ = write!(o, r#","kind":"{}"}}"#, kind.map_or("", kind_name));
             }
             o.push_str("]}");
         }
@@ -258,17 +295,21 @@ pub extern "system" fn Java_dev_ccptr_soundbridge_Native_start<'l>(
     _class: JClass<'l>,
     name: JString<'l>,
     send: jint,
+    mic_name: JString<'l>,
+    system_name: JString<'l>,
     denoise: jint,
     gate_lookahead_ms: jint,
     gate_hold_ms: jint,
     gate_threshold: jfloat,
     auto_gain: jboolean,
     gain_db: jint,
-    play: jboolean,
+    mute: JObjectArray<'l>,
     buffer_ms: jint,
     listener: JObject<'l>,
 ) -> jlong {
     let name = string(&mut env, &name);
+    let (mic_name, system_name) = (string(&mut env, &mic_name), string(&mut env, &system_name));
+    let mute = strings(&mut env, &mute);
     let (Ok(vm), Ok(listener)) = (env.get_java_vm(), env.new_global_ref(listener)) else {
         return 0;
     };
@@ -289,8 +330,8 @@ pub extern "system" fn Java_dev_ccptr_soundbridge_Native_start<'l>(
         }
     };
     let denoise = denoise_mode(denoise, gate_lookahead_ms, gate_hold_ms, gate_threshold);
-    let mic = Mic { denoise, auto_gain: auto_gain != 0, gain_db };
-    let config = config(name, send, mic, play != 0, buffer_ms);
+    let mic = Mic { name: mic_name, denoise, auto_gain: auto_gain != 0, gain_db };
+    let config = config(name, send, mic, system_name, mute, buffer_ms);
     match Engine::start(config, Arc::new(aaudio::AAudioBackend), on_event) {
         Ok(engine) => Box::into_raw(Box::new(engine)) as jlong,
         Err(e) => {
@@ -325,20 +366,24 @@ pub extern "system" fn Java_dev_ccptr_soundbridge_Native_configure<'l>(
     handle: jlong,
     name: JString<'l>,
     send: jint,
+    mic_name: JString<'l>,
+    system_name: JString<'l>,
     denoise: jint,
     gate_lookahead_ms: jint,
     gate_hold_ms: jint,
     gate_threshold: jfloat,
     auto_gain: jboolean,
     gain_db: jint,
-    play: jboolean,
+    mute: JObjectArray<'l>,
     buffer_ms: jint,
 ) {
     let name = string(&mut env, &name);
+    let (mic_name, system_name) = (string(&mut env, &mic_name), string(&mut env, &system_name));
+    let mute = strings(&mut env, &mute);
     if let Some(engine) = engine(handle) {
         let denoise = denoise_mode(denoise, gate_lookahead_ms, gate_hold_ms, gate_threshold);
-        let mic = Mic { denoise, auto_gain: auto_gain != 0, gain_db };
-        engine.configure(config(name, send, mic, play != 0, buffer_ms));
+        let mic = Mic { name: mic_name, denoise, auto_gain: auto_gain != 0, gain_db };
+        engine.configure(config(name, send, mic, system_name, mute, buffer_ms));
     }
 }
 
