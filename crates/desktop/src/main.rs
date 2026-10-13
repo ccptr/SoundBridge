@@ -1293,14 +1293,14 @@ impl Bridge {
             });
             let place = |what: &'static str, label: &'static str, to: &Route, cx: &mut Context<Self>| {
                 let (source, to) = (source.clone(), to.clone());
-                button(ElementId::Name(format!("{what} {source}").into()), label, route == to).flex_1().on_click(
+                button(ElementId::Name(format!("{what} {source}").into()), label, route == to).on_click(
                     cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.open_picker = None;
                         this.set_route(source.clone(), to.clone(), cx);
                     }),
                 )
             };
-            let mut places = div().flex().gap_2().child(place("stream-nothing", "Nothing", &nothing, cx));
+            let mut places = div().flex().items_start().gap_2().child(place("stream-nothing", "Nothing", &nothing, cx));
             // Only PipeWire lets us create the device ourselves.
             if cfg!(target_os = "linux") {
                 places = places.child(place("stream-virtual-mic", "Virtual microphone", &virtual_mic, cx));
@@ -1314,7 +1314,9 @@ impl Bridge {
             if title != source {
                 block = block.child(detail(source.clone()).truncate());
             }
-            let block = block.child(places).child(self.picker(Picker::Stream(source), &route, name, outputs, pick, cx));
+            // The list opens downwards from its end of the row.
+            let outputs = self.picker(Picker::Stream(source), &route, name, outputs, pick, cx);
+            let block = block.child(places.child(outputs.flex_1().min_w_0()));
             section = section.child(match route.play {
                 Play::VirtualMic => block.child(detail(
                     "Appears to other apps as the input device \"SoundBridge Microphone\" while connected.",
