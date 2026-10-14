@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -29,6 +30,7 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.background
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.LinearProgressIndicator
@@ -41,6 +43,7 @@ import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
@@ -49,28 +52,88 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlin.math.log10
+import kotlin.math.roundToInt
 
 /** API level of Android 17, which introduced ACCESS_LOCAL_NETWORK. */
 private const val ANDROID_17 = 37
 
 /** The longest name the protocol carries, in bytes. */
 private const val MAX_NAME_LEN = 64
+
+/**
+ * A number that is typed in where its steps do not have it: what it is, what
+ * may be typed, and what follows it where it is shown. [number] is how it
+ * reads, and [parse] brings what was typed into what it can be; the limits
+ * are the engine's (crates/core).
+ */
+private class Typed<T>(
+    val title: String,
+    val hint: String,
+    val unit: String,
+    val number: (T) -> String,
+    val parse: (Float) -> T,
+)
+
+private val typedGain = Typed(
+    title = "Gain",
+    hint = "In dB, from -40 to 40.",
+    unit = " dB",
+    number = { db -> if (db == 0) "0" else "%+d".format(db) },
+    parse = { it.roundToInt().coerceIn(-40, 40) },
+)
+
+private val typedLookahead = Typed(
+    title = "Look-ahead",
+    hint = "In ms, up to 200, in steps of 10.",
+    unit = " ms",
+    number = Int::toString,
+    parse = { it.roundToInt().coerceIn(0, 200) / 10 * 10 },
+)
+
+private val typedHold = Typed(
+    title = "Hold",
+    hint = "In ms, from 10 to 2000.",
+    unit = " ms",
+    number = Int::toString,
+    parse = { it.roundToInt().coerceIn(10, 2000) },
+)
+
+private val typedThreshold = Typed(
+    title = "Threshold",
+    hint = "From 0.05 to 0.95; lower is more lenient.",
+    unit = "",
+    number = Float::toString,
+    parse = { (it.coerceIn(0.05f, 0.95f) * 100).roundToInt() / 100f },
+)
+
+private val typedBuffer = Typed(
+    title = "Jitter buffer",
+    hint = "In ms, from 1 to 500.",
+    unit = " ms",
+    number = { ms -> if (ms == Native.BUFFER_AUTO) "" else ms.toString() },
+    parse = { it.roundToInt().coerceIn(1, 500) },
+)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -209,10 +272,11 @@ private fun Screen() {
             Section("Jitter buffer") {
                 Choices(
                     options = listOf(
-                        Native.BUFFER_AUTO to "Auto", 5 to "5 ms", 10 to "10 ms", 20 to "20 ms", 40 to "40 ms",
+                        Native.BUFFER_AUTO to "Auto", 5 to "5", 10 to "10", 20 to "20", 40 to "40 ms",
                     ),
                     selected = state.settings.bufferMs,
                     onSelect = { ms -> Bridge.update { it.copy(bufferMs = ms) } },
+                    typed = typedBuffer,
                 )
                 Hint(
                     if (state.settings.bufferMs == Native.BUFFER_AUTO) {
@@ -315,9 +379,10 @@ private fun MicControls(mic: MicSettings, update: ((MicSettings) -> MicSettings)
     DenoiseChoices(mic, update)
     Toggle("Automatic level", mic.autoGain) { on -> update { it.copy(autoGain = on) } }
     Choices(
-        options = listOf(-12 to "-12", -6 to "-6", 0 to "0 dB", 6 to "+6", 12 to "+12", 24 to "+24"),
+        options = listOf(-12 to "-12", -6 to "-6", 0 to "0 dB", 6 to "+6", 12 to "+12"),
         selected = mic.gainDb,
         onSelect = { db -> update { it.copy(gainDb = db) } },
+        typed = typedGain,
     )
     Hint(
         when {
@@ -362,9 +427,10 @@ private fun DenoiseChoices(settings: MicSettings, update: ((MicSettings) -> MicS
                     "Adds about ${gate.lookaheadMs + 10} ms of delay.",
             )
             Choices(
-                options = listOf(20 to "20 ms", 40 to "40 ms", 80 to "80 ms", 120 to "120 ms", 200 to "200 ms"),
+                options = listOf(20 to "20", 40 to "40", 80 to "80", 120 to "120", 200 to "200 ms"),
                 selected = gate.lookaheadMs,
                 onSelect = { ms -> tune { it.copy(lookaheadMs = ms) } },
+                typed = typedLookahead,
             )
             Hint(
                 "How far it listens ahead. More keeps the start of a word after a pause, " +
@@ -374,6 +440,7 @@ private fun DenoiseChoices(settings: MicSettings, update: ((MicSettings) -> MicS
                 options = listOf(100 to "0.1 s", 250 to "0.25 s", 500 to "0.5 s", 1000 to "1 s"),
                 selected = gate.holdMs,
                 onSelect = { ms -> tune { it.copy(holdMs = ms) } },
+                typed = typedHold,
             )
             Hint(
                 "How long it stays open after the voice stops. More bridges longer gaps, " +
@@ -383,6 +450,7 @@ private fun DenoiseChoices(settings: MicSettings, update: ((MicSettings) -> MicS
                 options = listOf(0.7f to "Strict", 0.5f to "Normal", 0.3f to "Lenient"),
                 selected = gate.threshold,
                 onSelect = { level -> tune { it.copy(threshold = level) } },
+                typed = typedThreshold,
             )
             Hint(
                 "How sure it must be that it hears a voice. Lenient opens for quiet speech, " +
@@ -435,22 +503,90 @@ private fun Toggle(label: String, checked: Boolean, onChange: (Boolean) -> Unit)
     }
 }
 
+/**
+ * A few steps of a setting. With [typed], a last one takes any value: it
+ * holds the value when that is none of the steps, and asks for one when tapped.
+ */
 @Composable
-private fun <T> Choices(options: List<Pair<T, String>>, selected: T, onSelect: (T) -> Unit) {
+private fun <T> Choices(options: List<Pair<T, String>>, selected: T, onSelect: (T) -> Unit, typed: Typed<T>? = null) {
+    val own = options.none { it.first == selected }
+    var typing by rememberSaveable { mutableStateOf(false) }
+    val count = options.size + if (typed != null) 1 else 0
     SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-        options.forEachIndexed { index, (value, label) ->
+        val segment = @Composable { index: Int, lit: Boolean, label: String, onClick: () -> Unit ->
             SegmentedButton(
-                selected = value == selected,
-                onClick = { onSelect(value) },
-                shape = SegmentedButtonDefaults.itemShape(index, options.size),
-                // The check mark would squeeze five options off a narrow screen.
+                selected = lit,
+                onClick = onClick,
+                shape = SegmentedButtonDefaults.itemShape(index, count),
+                // Six in a row on a narrow screen have no room for more.
+                contentPadding = PaddingValues(horizontal = 4.dp),
+                // Nor for the check mark.
                 icon = {},
             ) {
                 Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
+        options.forEachIndexed { index, (value, label) -> segment(index, value == selected, label) { onSelect(value) } }
+        if (typed != null) {
+            segment(options.size, own, if (own) typed.number(selected) + typed.unit else "…") { typing = true }
+        }
+    }
+    if (typed != null && typing) {
+        NumberDialog(
+            title = typed.title,
+            hint = typed.hint,
+            initial = typed.number(selected),
+            onSet = { number ->
+                typing = false
+                onSelect(typed.parse(number))
+            },
+            onDismiss = { typing = false },
+        )
     }
 }
+
+/** Asks for a number; [onSet] is given what was typed, once that is one. */
+@Composable
+private fun NumberDialog(
+    title: String, hint: String, initial: String, onSet: (Float) -> Unit, onDismiss: () -> Unit,
+) {
+    // What it is now, selected so that typing replaces it.
+    var field by remember { mutableStateOf(TextFieldValue(initial, TextRange(0, initial.length))) }
+    var invalid by remember { mutableStateOf(false) }
+    val focus = remember { FocusRequester() }
+    val set = {
+        val number = parseNumber(field.text)
+        if (number != null) onSet(number) else invalid = true
+    }
+    LaunchedEffect(Unit) { focus.requestFocus() }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            OutlinedTextField(
+                value = field,
+                onValueChange = {
+                    field = it
+                    invalid = false
+                },
+                singleLine = true,
+                isError = invalid,
+                supportingText = { Text(if (invalid) "That is not a number. $hint" else hint) },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { set() }),
+                modifier = Modifier.fillMaxWidth().focusRequester(focus),
+            )
+        },
+        confirmButton = { TextButton(onClick = set) { Text("Set") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+/** A number as it gets typed: with a decimal comma, or with its unit after it. */
+private fun parseNumber(text: String): Float? =
+    text.trim().trimEnd { it.isLetter() || it.isWhitespace() }
+        .replace(',', '.').replace('\u2212', '-')
+        .toFloatOrNull()?.takeIf { it.isFinite() }
 
 @Composable
 private fun PeersCard(state: UiState) {
